@@ -1,0 +1,42 @@
+# PencariMovie Server — build from source (developer loop).
+#
+#   docker compose -f docker-compose.dev.yml up -d --build
+#   docker compose -f docker-compose.dev.yml logs -f
+#
+# Context is the REPOSITORY ROOT: `src/` and the dashboard (`public/`) are
+# compiled into the binary by the root `Dockerfile`. This file used to point at
+# `context: ../..` + `server/Dockerfile` from a `server/` directory that does not
+# exist, so `docker compose` failed before it ever reached cargo.
+#
+# The image behaves like the published one: PM_APP_ROOT=/data, binds 0.0.0.0,
+# listens on 8088. Only the host port is worth overriding.
+services:
+  pencarimovie:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Stamped into `--version` and /api/version by build.rs. Without it the
+        # image reports the crate version (0.1.0) and every client shows
+        # "update available" on a build that is in fact current.
+        PM_BUILD_VERSION: ${PM_BUILD_VERSION:-local}
+    image: pencarimovie-server:dev
+    container_name: pencarimovie-server-dev
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8088}:8088"
+    environment:
+      # Optional knobs; the image already sets PORT / PM_LISTEN_HOST.
+      # PM_WORKERS: "4"        # one Telegram connection per worker
+      # PM_INFLIGHT: "8"       # upload.getFile parts in flight per connection
+      # PM_MAX_STREAMS: "256"  # concurrent /api/download bodies
+      TZ: ${TZ:-UTC}
+    volumes:
+      # sessions, auth.json, caches — MUST persist across image upgrades.
+      # /data, not /app/storage: PM_APP_ROOT=/data is what the engine reads, so a
+      # volume mounted on /app/storage is silently discarded and every recreate
+      # starts from an empty install.
+      - pm-storage:/data
+
+volumes:
+  pm-storage:

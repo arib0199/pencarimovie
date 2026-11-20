@@ -1,0 +1,82 @@
+name: Test Release Build & Installers
+
+# Scope note: the SERVED product is the Rust binary (crate at the repo root, built
+# and released by release.yml), so this workflow does not build it. What it does guard is the
+# two things a layout change can silently break:
+#
+#   * the user-facing installers at the repo root (their URLs are a public
+#     contract - `curl -fsSL telegra.my/linux | bash`), and
+#   * the ARCHIVED PHP tree under `legacy/php/`, which is still the behavioural
+#     reference for the port, so a stray edit that breaks its syntax should be
+#     caught here rather than discovered later.
+#
+# The PHP boot smoke test runs from `legacy/php/` because that is where
+# `router.php`/`backend.php` live now.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - "pencarimovie-linux.sh"
+      - "pencarimovie-termux.sh"
+      - "legacy/php/**"
+      - "scripts/**"
+      - ".github/workflows/test-build.yml"
+
+jobs:
+  test-installers:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install PHP
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y php-cli php-curl php-mbstring
+
+      - name: Validate PHP syntax (archived tree)
+        run: |
+          php -l legacy/php/backend.php
+          php -l legacy/php/router.php
+          php -l legacy/php/index.php
+
+      - name: Test Linux Shell Installer Syntax & Target Detection
+        run: |
+          chmod +x pencarimovie-linux.sh
+          bash -n pencarimovie-linux.sh
+          echo "Target detection on $(uname -s) $(uname -m):"
+          PENCARIMOVIE_NO_BANNER=1 bash -c 'source ./pencarimovie-linux.sh; detect_target'
+
+      - name: Test Termux Shell Installer Syntax
+        run: |
+          chmod +x pencarimovie-termux.sh
+          bash -n pencarimovie-termux.sh
+
+      # `router.php`/`backend.php` moved to legacy/php, so the server has to be
+      # booted from there. NOTE: this asserts the archived tree still RESPONDS; it
+      # does not assert the dashboard. `backend.php` resolves `public/`, `storage/`
+      # and `vendor/` relative to its own __DIR__, and only `bin/` moved with it -
+      # see legacy/php/README.md, "Known limitation".
+      - name: Test Server Boot & Manifest Response (archived PHP tree)
+        working-directory: legacy/php
+        run: |
+          PORT=8099 php -S 127.0.0.1:8099 router.php > /tmp/server.log 2>&1 &
+          SERVER_PID=$!
+          sleep 3
+
+          echo "Testing HTTP response..."
+          HTTP_CODE=$(curl -s -o /tmp/manifest.json -w "%{http_code}" http://127.0.0.1:8099/manifest.json || echo "000")
+          echo "Response code: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "Server failed to return 200 OK for /manifest.json"
+            cat /tmp/server.log
+            kill $SERVER_PID || true
+            exit 1
+          fi
+
+          echo "Manifest returned successfully:"
+          head -n 20 /tmp/manifest.json
+          kill $SERVER_PID || true

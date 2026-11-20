@@ -1,0 +1,1965 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=5.0, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#0b0c10" />
+    <title>PencariMovie Server — Dashboard</title>
+    <link rel="icon" type="image/png" href="logo.png?v=20261021b" />
+    <link rel="apple-touch-icon" href="logo.png?v=20261021b" />
+    <link rel="stylesheet" href="stream-theme.css?v=20261009pm10" />
+    <link rel="stylesheet" href="styles.css?v=20261024music2" />
+    <!-- last on purpose: the Titanium tokens must win over the legacy
+         media-shell stylesheets for the relocated settings markup -->
+    <link rel="stylesheet" href="dashboard.css?v=20261112botactions1" />
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"
+      crossorigin="anonymous"
+      referrerpolicy="no-referrer"
+    />
+    <script src="assets/runtime/legacy-features.js?v=20261028dash18"></script>
+  </head>
+  <body class="stream-dark" data-pm-shell="dashboard">
+    <!-- No #loadingScreen here on purpose. It was a media-shell overlay whose
+         only exit was showSettingsGate()/hideSettingsGate(), and those return
+         early now that there is no gate — so disconnect left "Provisioning guest
+         bot..." up forever. A control panel must never block itself; every
+         in-flight state has its own status line (bot pool, tunnel, checklist). -->
+
+    <!-- ─── Update Required Overlay ──────────────────────────── -->
+    <div
+      id="updateRequiredOverlay"
+      class="update-required hidden"
+      aria-hidden="true"
+    >
+      <div class="update-required__card">
+        <div class="update-required__icon">&#x26A0;&#xFE0F;</div>
+        <h2 class="update-required__title">Update Required</h2>
+        <p class="update-required__desc">
+          Your app version is outdated. Please update to continue using
+          PencariMovie Server.
+        </p>
+        <div class="update-required__details">
+          <span
+            >Current:
+            <strong class="update-required__version-current"
+              >0.0.0</strong
+            ></span
+          >
+          <span
+            >Minimum:
+            <strong class="update-required__version-minimum"
+              >0.0.0</strong
+            ></span
+          >
+        </div>
+        <a class="update-required__link" href="#" target="_blank" rel="noopener"
+          >Download Update</a
+        >
+      </div>
+    </div>
+
+    <!-- ─── Fatal Error Overlay (missing dependency / unsupported OS) ── -->
+    <div id="fatalErrorOverlay" class="fatal-error hidden" aria-hidden="true">
+      <div class="fatal-error__card">
+        <div class="fatal-error__icon">&#x26A0;&#xFE0F;</div>
+        <h2 class="fatal-error__title">PencariMovie Server cannot start</h2>
+        <p class="fatal-error__desc">
+          The server is missing a required component or is running on an
+          unsupported platform. Entering a bot token will not fix this.
+        </p>
+        <ul id="fatalErrorProblems" class="fatal-error__list"></ul>
+        <div id="fatalErrorHints" class="fatal-error__hints"></div>
+        <button id="fatalErrorRetry" class="fatal-error__btn">Retry</button>
+      </div>
+    </div>
+
+    <!-- ─── Auth Gate (server password) ────────────────────────── -->
+    <div id="authGate" class="settings-gate hidden" aria-hidden="true">
+      <div class="settings-gate__card">
+        <h2 class="settings-gate__title">🔒 PencariMovie Server</h2>
+        <div
+          class="settings-gate__notice"
+          style="
+            margin-top: 16px;
+            padding: 12px 14px;
+            background: var(--pm-bg-subtle);
+            border: 1px solid var(--pm-border-subtle);
+            border-radius: 8px;
+            font-size: 0.82rem;
+            color: var(--pm-text-secondary);
+            line-height: 1.5;
+            text-align: left;
+          "
+        >
+          PencariMovie Server is free. We do not sell access or subscriptions. If this
+          is not your personal server, you can run your own at no cost on any device
+          (phone, PC, TV, VPS, cloud) with the installer from
+          <a
+            href="https://telegra.my"
+            target="_blank"
+            rel="noopener"
+            style="color: var(--accent, var(--pm-accent)); font-weight: 600; text-decoration: underline"
+            >telegra.my</a
+          >.
+        </div>
+
+        <details id="authDetails" class="settings-gate__details">
+          <summary
+            id="authSummary"
+            class="settings-gate__summary"
+            tabindex="0"
+          >
+            Server owner? Click to enter password
+          </summary>
+          <div style="margin-top: 14px">
+            <p class="settings-gate__desc" style="margin-bottom: 12px; font-size: 0.82rem; color: var(--pm-text-muted);">
+              Enter server password to continue. (Default: <code>123456</code>)
+            </p>
+            <div class="settings-gate__field">
+              <label class="settings-gate__label" for="authPasswordInput"
+                >Server Password</label
+              >
+              <input
+                type="password"
+                id="authPasswordInput"
+                class="settings-gate__input"
+                placeholder="Password"
+                autocomplete="current-password"
+              />
+            </div>
+            <button id="authConnectBtn" class="settings-gate__btn" style="width: 100%">Connect</button>
+            <div id="authStatus" class="settings-gate__status"></div>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <!-- ─── Settings Gate (bot login) ────────────────────────── -->
+
+    <!-- ─── Server Dashboard ────────────────────────────────────── -->
+    <div class="pm-shell" id="pmDashboard">
+      <header class="pm-header">
+        <div class="pm-container pm-header__inner">
+          <div class="pm-brand">
+            <img src="logo.png?v=20261021b" alt="" class="pm-brand__logo" />
+            <span class="pm-brand__title">PencariMovie Server</span>
+          </div>
+          <div class="pm-status">
+            <span class="pm-pill pm-pill--live" id="dashOnlineBadge">
+              <span class="pm-dot" aria-hidden="true"></span>
+              <span id="dashOnlineText">Checking</span>
+            </span>
+            <span class="pm-pill pm-pill--muted" id="dashVersion"></span>
+            <!-- Shown only when /api/update/check reports a newer release. A button,
+                 not a link: it opens the card below, which names the update path that
+                 actually works on this host. -->
+            <button
+              type="button"
+              class="pm-pill pm-pill--warn hidden"
+              id="dashUpdatePill"
+              aria-haspopup="dialog"
+              aria-expanded="false"
+              aria-controls="dashUpdateCard"
+            >
+              Update
+            </button>
+            <span class="pm-pill pm-pill--muted" id="dashHostPill"></span>
+            <!-- Ends the dashboard session: clears the pm_auth cookie through the
+                 server and the localStorage token `requestJson()` sends. Last in
+                 the row because it is the way out, not a status readout. -->
+            <button
+              type="button"
+              class="pm-pill pm-pill--muted pm-pill--logout"
+              id="logoutBtn"
+              title="Log out of this dashboard session"
+            >
+              <svg
+                class="pm-logout__icon"
+                viewBox="0 0 16 16"
+                width="12"
+                height="12"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+                focusable="false"
+              >
+                <path d="M9.5 2.5H12a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H9.5" />
+                <path d="M6.5 11 9.5 8 6.5 5" />
+                <path d="M9.5 8h-7" />
+              </svg>
+              <span class="pm-logout__label">Log out</span>
+            </button>
+          </div>
+          <!-- The popover. Anchored to the status row, closed by \u00d7, Escape or a
+               click outside; it never covers the page it is about. -->
+          <div
+            class="pm-update-card hidden"
+            id="dashUpdateCard"
+            role="dialog"
+            aria-labelledby="dashUpdateTitle"
+          >
+            <div class="pm-update-card__head">
+              <strong id="dashUpdateTitle">Update available</strong>
+              <button
+                type="button"
+                class="pm-update-card__close"
+                id="dashUpdateClose"
+                aria-label="Close update notice"
+              >&times;</button>
+            </div>
+            <p class="pm-update-card__body" id="dashUpdateBody"></p>
+            <code class="pm-update-card__cmd hidden" id="dashUpdateCmd"></code>
+            <div class="pm-update-card__actions">
+              <button type="button" class="pm-btn pm-btn--sm hidden" id="dashUpdateApply">
+                Update now
+              </button>
+              <a class="pm-btn pm-btn--sm" id="dashUpdateLink" href="#" target="_blank" rel="noopener">
+                Release notes
+              </a>
+            </div>
+            <p class="pm-update-card__msg hidden" id="dashUpdateMsg"></p>
+          </div>
+        </div>
+        <nav class="pm-nav" id="pmNav" aria-label="Sections">
+          <div class="pm-container pm-nav__inner">
+            <button type="button" class="pm-nav__item" data-section="overview">Overview</button>
+            <button type="button" class="pm-nav__item" data-section="addon">Addon</button>
+            <button type="button" class="pm-nav__item" data-section="bots">Bots</button>
+            <button type="button" class="pm-nav__item" data-section="tunnel">Tunnel</button>
+            <button type="button" class="pm-nav__item" data-section="catalogs">Catalogs</button>
+            <button type="button" class="pm-nav__item" data-section="system">System</button>
+          </div>
+        </nav>
+      </header>
+
+      <main class="pm-main">
+        <div class="pm-container">
+
+          <!-- ─── Overview ───────────────────────────────────────── -->
+          <section class="pm-panel" id="tab-overview" data-panel="overview">
+            <div class="pm-launch">
+              <h1 class="pm-h1">Nuvio TV Web Player</h1>
+              <p class="pm-lede">
+                Full-screen media browser and video player for the catalogs this server
+                exposes. Opens as its own page, so refreshing never loses your place.
+              </p>
+              <div class="pm-row">
+                <a class="pm-btn pm-btn--primary" href="nuvio.html">Launch web player</a>
+                <a
+              id="settingsSearchWebsiteBtn"
+              class="settings-gate__btn"
+              href="https://pencarimovie.com/search/"
+              target="_blank"
+              rel="noopener"
+              title="Search on pencarimovie.com"
+              style="
+                width: 100%;
+                padding: 10px 14px;
+                font-size: 0.88rem;
+                background: var(--pm-bg-surface-elevated);
+                border: 1px solid var(--pm-border-subtle);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                gap: 6px;
+                cursor: pointer;
+                text-decoration: none;
+                box-sizing: border-box;
+              "
+            >
+              Search on pencarimovie.com
+            </a>
+              </div>
+            </div>
+
+            <div class="pm-card" id="pmLiveCard">
+              <h2 class="pm-h2">Live</h2>
+              <!-- Every tile answers a question in words, and carries the words that
+                   make its number mean something. "Memory 617 MB of 1 GB" is a fact;
+                   "RAM 617 MB / 62 GB" was the dyno HOST's RAM, which nobody can act
+                   on. Disk and cache are deliberately absent: one is the host's
+                   ephemeral volume, the other is a tuning number with no user meaning.
+                   They stay available at /api/cache/stats and in the reports. -->
+              <div class="pm-statgrid" id="pmLiveGrid">
+                <div class="pm-stat" data-state="ok" id="pmLiveStreams">
+                  <span class="pm-stat__label">Watching</span>
+                  <span class="pm-stat__value">&mdash;</span>
+                  <span class="pm-stat__unit"></span>
+                  <small class="pm-stat__note">players / different titles</small>
+                </div>
+                <div class="pm-stat" data-state="ok" id="pmLiveOnline">
+                  <span class="pm-stat__label">People online</span>
+                  <span class="pm-stat__value">&mdash;</span>
+                  <span class="pm-stat__unit"></span>
+                  <small class="pm-stat__note">seen in the last 5 min</small>
+                </div>
+                <!-- Bots are a POOL: "2 / 3 up" is healthy members over pool size.
+                     A single "Connected" hid the two bots that were flood-waited. -->
+                <div class="pm-stat" data-state="ok" id="pmLiveBots">
+                  <span class="pm-stat__label">Bots</span>
+                  <span class="pm-stat__value">&mdash;</span>
+                  <span class="pm-stat__unit">up</span>
+                  <small class="pm-stat__note">able to stream right now</small>
+                </div>
+                <div class="pm-stat" data-state="ok" id="pmLiveCpu">
+                  <span class="pm-stat__label">CPU</span>
+                  <span class="pm-stat__value">&mdash;</span>
+                  <span class="pm-stat__unit"></span>
+                  <small class="pm-stat__note">of one core</small>
+                </div>
+                <div class="pm-stat" data-state="ok" id="pmLiveRam">
+                  <span class="pm-stat__label">Memory</span>
+                  <span class="pm-stat__value">&mdash;</span>
+                  <span class="pm-stat__unit"></span>
+                  <small class="pm-stat__note" id="pmLiveRamNote">in use</small>
+                </div>
+                <div class="pm-stat" data-state="ok" id="pmLiveUptime">
+                  <span class="pm-stat__label">Running for</span>
+                  <span class="pm-stat__value">&mdash;</span>
+                  <span class="pm-stat__unit"></span>
+                  <small class="pm-stat__note">since the last restart</small>
+                </div>
+              </div>
+            </div>
+
+            <div class="pm-card" id="pmSetupCard">
+              <h2 class="pm-h2">Finish setup</h2>
+              <!-- Every row here, including "The PencariMovie API answers", is rendered
+                   by `renderChecklist()` from a live endpoint. The list hides itself and
+                   only #pmChecklistReady shows once nothing is wrong. -->
+              <ul class="pm-checklist" id="pmChecklist"></ul>
+              <p class="pm-done hidden" id="pmChecklistReady">All set. Every step below is done.</p>
+            </div>
+          </section>
+
+          <!-- ─── Addon ──────────────────────────────────────────── -->
+          <section class="pm-panel hidden" id="tab-addon" data-panel="addon">
+            <h2 class="pm-h2">Addon address</h2>
+            <p class="pm-lede">
+              One address works in every Stremio-compatible client: Stremio, Nuvio,
+              Streamr, Debrify, WuPlay, Playtario, ARVIO and Cinaura. The address is
+              built for the network you opened this page from, so it is this machine,
+              your Wi-Fi, or the public tunnel.
+            </p>
+
+            <details class="pm-details">
+              <summary class="pm-details__summary">Access token</summary>
+              <p class="pm-hint">
+                Only the public (server and tunnel) addresses below carry this token — a
+                localhost or Wi-Fi address never needs it, so it is left out there.
+                Regenerate it only if it has leaked; every public client will then need
+                the new address.
+              </p>
+              <div class="addon-catalog-card" id="addonTokenCard">
+          <div class="addon-catalog-card__header">
+            <span class="addon-catalog-card__title">Access Token</span>
+            <span class="addon-catalog-card__badge" id="addonTokenBadge"
+              >Active</span
+            >
+          </div>
+          <div style="display: flex; gap: 8px; align-items: center; width: 100%; box-sizing: border-box;">
+            <input
+              type="text"
+              id="addonTokenInput"
+              class="settings-gate__input"
+              style="font-family: monospace; font-size: 0.82rem; flex: 1 1 0%; min-width: 0; box-sizing: border-box;"
+              readonly
+              value=""
+            />
+            <button
+              type="button"
+              id="addonTokenCopyBtn"
+              class="settings-gate__btn"
+              style="
+                flex: 0 0 auto;
+                white-space: nowrap;
+                padding: 8px 12px;
+                font-size: 0.82rem;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+              "
+            >
+              Copy
+            </button>
+            <button
+              type="button"
+              id="addonTokenRotateBtn"
+              class="settings-gate__btn"
+              style="
+                flex: 0 0 auto;
+                white-space: nowrap;
+                padding: 8px 12px;
+                font-size: 0.82rem;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                gap: 4px;
+              "
+            >
+              Regenerate
+            </button>
+          </div>
+          <div
+            id="addonTokenStatus"
+            class="addon-catalog-status-msg hidden"
+          ></div>
+        </div>
+            </details>
+
+            <div class="settings-gate__field" id="addonLanField">
+          <div
+            style="
+              display: flex;
+              justify-content: space-between;
+              align-items: center;
+              margin-bottom: 6px;
+            "
+          >
+            <label
+              class="settings-gate__label"
+              for="addonManifestLanInput"
+              style="margin-bottom: 0"
+            >
+              Wi-Fi / LAN Manifest (TV, Phone, Tablet)
+            </label>
+            <span
+              style="
+                font-size: 0.72rem;
+                background: var(--pm-status-online-bg);
+                color: var(--pm-status-online);
+                padding: 2px 6px;
+                border-radius: 6px;
+                font-weight: 600;
+              "
+              >Remote</span
+            >
+          </div>
+          <div style="display: flex; gap: 8px; align-items: center; width: 100%; box-sizing: border-box;">
+            <input
+              type="text"
+              id="addonManifestLanInput"
+              class="settings-gate__input"
+              style="color: var(--pm-status-online); font-family: monospace; font-size: 0.88rem; flex: 1 1 0%; min-width: 0; box-sizing: border-box;"
+              readonly
+              value=""
+            />
+            <button
+              id="copyAddonManifestLanBtn"
+              class="settings-gate__btn"
+              style="
+                flex: 0 0 auto;
+                white-space: nowrap;
+                padding: 0 16px;
+                height: 38px;
+                min-width: 104px;
+                font-size: 0.85rem;
+                border-radius: 8px;
+                box-sizing: border-box;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                gap: 4px;
+              "
+            >
+              Copy
+            </button>
+          </div>
+        </div>
+              <div class="settings-gate__field" id="addonLocalField">
+          <div
+            style="
+              display: flex;
+              justify-content: space-between;
+              align-items: center;
+              margin-bottom: 6px;
+            "
+          >
+            <label
+              class="settings-gate__label"
+              id="addonLocalFieldLabel"
+              for="addonManifestInput"
+              style="margin-bottom: 0"
+            >
+              Localhost Manifest (This Device Only)
+            </label>
+            <span
+              id="addonLocalFieldBadge"
+              style="
+                font-size: 0.72rem;
+                background: var(--pm-border-subtle);
+                color: var(--pm-text-secondary);
+                padding: 2px 6px;
+                border-radius: 6px;
+                font-weight: 600;
+              "
+              >Local</span
+            >
+          </div>
+          <div style="display: flex; gap: 8px; align-items: center; width: 100%; box-sizing: border-box;">
+            <input
+              type="text"
+              id="addonManifestInput"
+              class="settings-gate__input"
+              style="color: var(--pm-text-secondary); font-family: monospace; font-size: 0.88rem; flex: 1 1 0%; min-width: 0; box-sizing: border-box;"
+              readonly
+              value=""
+            />
+            <button
+              id="copyAddonManifestBtn"
+              class="settings-gate__btn"
+              style="
+                background: var(--pm-bg-surface-hover);
+                color: var(--pm-text-primary);
+                flex: 0 0 auto;
+                white-space: nowrap;
+                padding: 0 16px;
+                height: 38px;
+                min-width: 104px;
+                font-size: 0.85rem;
+                border-radius: 8px;
+                box-sizing: border-box;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                gap: 4px;
+              "
+            >
+              Copy
+            </button>
+          </div>
+        </div>
+              <div class="settings-gate__field hidden" id="addonTunnelField">
+          <div
+            style="
+              display: flex;
+              justify-content: space-between;
+              align-items: center;
+              margin-bottom: 6px;
+            "
+          >
+            <label
+              class="settings-gate__label"
+              for="addonManifestTunnelInput"
+              style="margin-bottom: 0"
+            >
+              Cloudflare Tunnel Manifest
+            </label>
+            <span
+              style="
+                font-size: 0.72rem;
+                background: var(--pm-bg-subtle);
+                color: var(--pm-text-secondary);
+                padding: 2px 6px;
+                border-radius: 6px;
+                font-weight: 600;
+              "
+              >Public</span
+            >
+          </div>
+          <div style="display: flex; gap: 8px; align-items: center; width: 100%; box-sizing: border-box;">
+            <input
+              type="text"
+              id="addonManifestTunnelInput"
+              class="settings-gate__input"
+              style="color: var(--pm-text-secondary); font-family: monospace; font-size: 0.88rem; flex: 1 1 0%; min-width: 0; box-sizing: border-box;"
+              readonly
+              value=""
+            />
+            <button
+              id="copyAddonManifestTunnelBtn"
+              class="settings-gate__btn"
+              style="
+                flex: 0 0 auto;
+                white-space: nowrap;
+                padding: 0 16px;
+                height: 38px;
+                min-width: 104px;
+                font-size: 0.85rem;
+                border-radius: 8px;
+                box-sizing: border-box;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                gap: 4px;
+              "
+            >
+              Copy
+            </button>
+          </div>
+          <a
+            id="addonStremioDirectBtn"
+            class="settings-gate__btn hidden"
+            href="#"
+            target="_blank"
+            rel="noopener noreferrer"
+            style="
+              display: flex;
+              align-items: center;
+              justify-content: center;
+              gap: 8px;
+              width: 100%;
+              margin-top: 10px;
+              padding: 10px 16px;
+              text-decoration: none;
+              font-weight: 600;
+              background: var(--pm-accent);
+              color: var(--pm-text-primary);
+              box-sizing: border-box;
+            "
+          >
+            Add to Stremio
+          </a>
+        </div>
+              <div class="pm-card pm-card--inset" id="addonSyncCard">
+                <h3 class="pm-h3">Install in Stremio from this page</h3>
+                <p class="pm-hint">
+                  Local and LAN only. Stremio Web will not accept a plain http addon
+                  address, so this page sends the http manifest to your Stremio account
+                  through Stremio's own API.
+                </p>
+                <div class="addon-stremio-sync" id="addonStremioSync">
+          <div class="addon-stremio-sync__title">
+            Install in Stremio (HTTP API Sync)
+          </div>
+          <p class="addon-stremio-sync__desc">
+            Your credentials go only to <code>api.strem.io</code>. Nothing is
+            stored on this server.
+          </p>
+
+          <div
+            class="addon-mode-toggle"
+            role="radiogroup"
+            aria-label="Manifest address"
+            id="stremioSyncModeToggle"
+          >
+            <label class="addon-mode-toggle__option">
+              <input
+                type="radio"
+                name="stremioSyncMode"
+                id="stremioSyncModeLan"
+                value="lan"
+                checked
+              />
+              <span>Wi-Fi / LAN</span>
+            </label>
+            <label class="addon-mode-toggle__option">
+              <input
+                type="radio"
+                name="stremioSyncMode"
+                id="stremioSyncModeLocal"
+                value="localhost"
+              />
+              <span>Localhost</span>
+            </label>
+          </div>
+          <div class="addon-stremio-sync__url" id="stremioSyncUrlPreview"></div>
+
+          <div class="settings-gate__field">
+            <label class="settings-gate__label" for="stremioSyncEmail"
+              >Stremio Email</label
+            >
+            <input
+              type="email"
+              id="stremioSyncEmail"
+              class="settings-gate__input"
+              autocomplete="username"
+              placeholder="you@example.com"
+            />
+          </div>
+          <div class="settings-gate__field">
+            <label class="settings-gate__label" for="stremioSyncPassword"
+              >Stremio Password</label
+            >
+            <input
+              type="password"
+              id="stremioSyncPassword"
+              class="settings-gate__input"
+              autocomplete="current-password"
+              placeholder="Your Stremio password"
+            />
+          </div>
+          <div class="settings-gate__field">
+            <label class="settings-gate__label" for="stremioSyncAuthKey"
+              >Auth Key (optional)</label
+            >
+            <input
+              type="password"
+              id="stremioSyncAuthKey"
+              class="settings-gate__input"
+              autocomplete="off"
+              placeholder="Paste instead of email/password"
+            />
+            <p class="addon-stremio-sync__hint">
+              From Stremio Web DevTools:
+              <code>JSON.parse(localStorage.getItem("profile")).auth.key</code>
+            </p>
+          </div>
+          <button
+            type="button"
+            id="stremioSyncInstallBtn"
+            class="settings-gate__btn addon-stremio-sync__btn"
+          >
+            Install via Stremio API Sync
+          </button>
+          <div
+            id="stremioSyncStatus"
+            class="settings-gate__status hidden"
+          ></div>
+        </div>
+              </div>
+              <div id="addonCopiedStatus" class="settings-gate__status ok hidden">
+          Copied to clipboard!
+        </div>
+
+            <div class="pm-card pm-card--inset">
+              <h3 class="pm-h3">Install steps</h3>
+              <p class="pm-hint">
+                The same address goes into the add-ons screen of every client above.
+              </p>
+              <div
+          class="instructions"
+          id="addonNuvioInstructions"
+          style="
+            margin-top: 18px;
+            text-align: left;
+            background: var(--pm-bg-canvas);
+            padding: 14px 16px;
+            border-radius: 8px;
+            border: 1px solid var(--pm-border-subtle);
+          "
+        >
+          <div
+            style="
+              font-size: 0.88rem;
+              font-weight: 700;
+              color: var(--pm-text-primary);
+              margin-bottom: 8px;
+            "
+          >
+            How to install:
+          </div>
+          <ol
+            style="
+              margin-left: 18px;
+              color: var(--pm-text-secondary);
+              font-size: 0.82rem;
+              line-height: 1.5;
+            "
+          >
+            <li style="margin-bottom: 4px">
+              Make sure the device running the client can reach this server: the
+              <strong>same Wi-Fi network</strong>, or the public tunnel.
+            </li>
+            <li style="margin-bottom: 4px">
+              Open <strong>Stremio</strong>, <strong>Nuvio</strong>,
+              <strong>Streamr</strong>, <strong>Debrify</strong>,
+              <strong>WuPlay</strong>, <strong>Playtario</strong>,
+              <strong>ARVIO</strong> or <strong>Cinaura</strong>.
+            </li>
+            <li style="margin-bottom: 4px">
+              Go to that client's <strong>add-ons</strong> screen and choose to add
+              an add-on by URL.
+            </li>
+            <li>
+              Paste the address above and confirm. The add-on appears as
+              PencariMovie.
+            </li>
+          </ol>
+        </div>
+            </div>
+
+            <div class="pm-card pm-card--inset" style="margin-top: 16px">
+              <h3 class="pm-h3">Music add-on</h3>
+              <p class="pm-hint">
+                The only manifest that differs. Served from
+                <code>/music/manifest.json</code>, and it never uses a Wi-Fi address
+                because that address changes whenever your router hands out a new one.
+              </p>
+              <div id="pmMusicField">
+        <div class="settings-gate__field" style="margin-top: 16px;">
+          <div
+            style="
+              display: flex;
+              align-items: center;
+              justify-content: space-between;
+              margin-bottom: 6px;
+            "
+          >
+            <label
+              class="settings-gate__label"
+              for="addonManifestEclipseInput"
+              style="margin-bottom: 0"
+            >
+              MUSIC MANIFEST
+            </label>
+            <span
+              style="
+                font-size: 0.72rem;
+                background: var(--pm-bg-subtle);
+                color: var(--pm-text-secondary);
+                padding: 2px 6px;
+                border-radius: 6px;
+                font-weight: 600;
+              "
+              >Music</span
+            >
+          </div>
+          <div style="display: flex; gap: 8px">
+            <input
+              type="text"
+              id="addonManifestEclipseInput"
+              class="settings-gate__input"
+              style="color: var(--pm-text-secondary); font-family: monospace; font-size: 0.88rem; flex: 1 1 0%; min-width: 0; box-sizing: border-box;"
+              readonly
+              value=""
+            />
+            <button
+              id="copyAddonManifestEclipseBtn"
+              class="settings-gate__btn"
+              style="
+                flex: 0 0 auto;
+                white-space: nowrap;
+                padding: 0 16px;
+                height: 38px;
+                min-width: 104px;
+                font-size: 0.85rem;
+                border-radius: 8px;
+                box-sizing: border-box;
+                background: var(--pm-accent);
+                color: var(--pm-text-primary);
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                gap: 4px;
+              "
+            >
+              Copy
+            </button>
+          </div>
+        </div></div>
+            </div>
+          </section>
+
+          <!-- ─── Bots ───────────────────────────────────────────── -->
+          <section class="pm-panel hidden" id="tab-bots" data-panel="bots">
+            <!-- The version lives once, in the sticky header (#dashVersion).
+                 #settingsVersion and #settingsConnectedVersion are not carried
+                 over: renderSettingsVersion() wrote the same string into both,
+                 and in the old gate only one was ever on screen. -->
+            <h2 class="pm-h2">Telegram bot pool</h2>
+            <div
+            id="settingsConnectedStatus"
+            class="settings-gate__status"
+            style="margin: 0 0 10px 0; text-align: center"
+          ></div>
+            <div id="settingsTokenSection">
+          <p id="settingsDesc" class="settings-gate__desc">
+            Enter your Telegram Bot Token to connect.
+            <br /><small
+              >Get one from
+              <a
+                href="https://t.me/CreateNewTelegramBot?start=localserver"
+                target="_blank"
+                rel="noopener"
+                >@CreateNewTelegramBot</a
+              ></small
+            >
+          </p>
+          <div class="settings-gate__field">
+            <label for="botTokenInput" class="settings-gate__label"
+              >Bot Token(s)</label
+            >
+            <textarea
+              id="botTokenInput"
+              class="settings-gate__input"
+              style="
+                height: 72px;
+                font-size: 0.85rem;
+                font-family: monospace;
+                resize: vertical;
+                box-sizing: border-box;
+                padding: 8px 10px;
+                line-height: 1.4;
+              "
+              placeholder="Enter 1 or more bot tokens (one per line)..."
+              autocomplete="off"
+            ></textarea>
+          </div>
+          <div id="settingsStatus" class="settings-gate__status"></div>
+          <div class="settings-gate__actions">
+            <button id="connectBtn" class="settings-gate__btn">Connect</button>
+          </div>
+          <!-- The old trailing escape hatch is gone: its button duplicated
+               #settingsDisconnectBtn (both bound to the same afterLogout) and
+               the sentence only made sense when the token form was the sole
+               face and the connected face lived in the other overlay. -->
+        </div>
+            <div class="settings-gate__bots-container">
+            <div class="settings-gate__bots-header">
+              <span class="settings-gate__bots-title"
+                >Bot Pool (<span id="botPoolCount">1</span>)</span
+              >
+              <div class="settings-gate__bots-actions">
+                <!-- Lives here, not beside #settingsTokenSection's copy: that
+                     section is hidden as soon as a session exists
+                     (applyBotsVisibility), which took the only way to obtain a
+                     token with it, so the pool could only ever shrink. -->
+                <a
+                  class="settings-gate__link"
+                  id="createBotLink"
+                  href="https://t.me/CreateNewTelegramBot?start=localserver"
+                  target="_blank"
+                  rel="noopener"
+                  title="Opens @CreateNewTelegramBot on Telegram"
+                  >Create a bot</a
+                >
+                <button
+                  type="button"
+                  id="toggleAddBotsBtn"
+                  class="settings-gate__link"
+                  style="
+                    font-size: 0.8rem;
+                    color: var(--pm-accent);
+                    cursor: pointer;
+                    white-space: nowrap;
+                  "
+                >
+                  + Add More Bots
+                </button>
+              </div>
+            </div>
+
+            <div
+              id="addBotsSection"
+              class="hidden"
+              style="margin-bottom: 12px; width: 100%; box-sizing: border-box"
+            >
+              <textarea
+                id="bulkBotTokensInput"
+                class="settings-gate__input"
+                style="
+                  height: 65px;
+                  font-size: 0.78rem;
+                  font-family: monospace;
+                  resize: vertical;
+                  box-sizing: border-box;
+                "
+                placeholder="Paste 1 or more bot tokens (one per line)..."
+              ></textarea>
+              <div
+                style="
+                  display: flex;
+                  gap: 6px;
+                  margin-top: 6px;
+                  width: 100%;
+                  box-sizing: border-box;
+                "
+              >
+                <button
+                  type="button"
+                  id="submitAddBotsBtn"
+                  class="settings-gate__btn"
+                  style="padding: 6px 12px; font-size: 0.8rem; flex: 1"
+                >
+                  Connect Bots
+                </button>
+                <button
+                  type="button"
+                  id="cancelAddBotsBtn"
+                  class="settings-gate__btn"
+                  style="
+                    padding: 6px 12px;
+                    font-size: 0.8rem;
+                    background: var(--pm-bg-surface-hover);
+                    color: var(--pm-text-secondary);
+                  "
+                >
+                  Cancel
+                </button>
+              </div>
+              <div
+                id="addBotsStatus"
+                style="
+                  font-size: 0.78rem;
+                  margin-top: 4px;
+                  color: var(--pm-accent);
+                  word-break: break-word;
+                "
+              ></div>
+            </div>
+
+            <div id="botPoolList" class="settings-gate__bots-list"></div>
+          </div>
+            <div style="display: flex; gap: 8px; margin-top: 14px">
+            <button
+              id="settingsDisconnectBtn"
+              class="settings-gate__btn settings-gate__btn--danger"
+              style="flex: 1"
+            >
+              Disconnect All
+            </button>
+          </div>
+          </section>
+
+          <!-- ─── Tunnel ─────────────────────────────────────────── -->
+          <section class="pm-panel hidden" id="tab-tunnel" data-panel="tunnel">
+            <h2 class="pm-h2">Cloudflare tunnel</h2>
+            <p class="pm-lede">
+              Exposes this server on a public HTTPS address so clients outside your
+              network can reach it.
+            </p>
+            <div class="settings-gate__addon-box settings-gate__tunnel-box">
+            <span>Cloudflare Tunnel</span>
+            <p class="settings-gate__tunnel-desc" id="tunnelDescText">
+              Expose this server publicly for remote streaming. Leave blank for
+              a free automatic Quick Tunnel (<code>*.trycloudflare.com</code>),
+              or paste your Cloudflare Zero Trust Tunnel Token to use your own
+              custom domain.
+            </p>
+
+            <div style="margin: 10px 0 6px 0">
+              <input
+                type="password"
+                id="tunnelTokenInput"
+                class="settings-gate__input"
+                placeholder="Cloudflare Tunnel Token (optional, leave blank for auto Quick Tunnel)"
+                autocomplete="off"
+                spellcheck="false"
+              />
+            </div>
+
+            <div class="settings-gate__tunnel-status" id="tunnelStatusText">
+              Tunnel is off.
+            </div>
+            <div class="settings-gate__tunnel-url-row hidden" id="tunnelUrlRow">
+              <input
+                type="text"
+                id="tunnelUrlInput"
+                class="settings-gate__input"
+                readonly
+                value=""
+              />
+              <button
+                type="button"
+                id="copyTunnelUrlBtn"
+                class="settings-gate__btn"
+              >
+                Copy
+              </button>
+            </div>
+
+            <div
+              class="settings-gate__tunnel-actions"
+              id="tunnelLocalActions"
+              style="margin-top: 10px"
+            >
+              <button
+                type="button"
+                id="enableTunnelBtn"
+                class="settings-gate__btn"
+              >
+                Enable Tunnel
+              </button>
+              <button
+                type="button"
+                id="disableTunnelBtn"
+                class="settings-gate__btn settings-gate__btn--danger hidden"
+              >
+                Disable
+              </button>
+            </div>
+          </div>
+          </section>
+
+          <!-- ─── System ─────────────────────────────────────────── -->
+          <!-- ─── Catalogs ───────────────────────────────────────── -->
+          <section class="pm-panel hidden" id="tab-catalogs" data-panel="catalogs">
+            <h2 class="pm-h2">Catalogs</h2>
+            <p class="pm-lede">
+              Catalogs and stream filters apply to every client at once.
+            </p>
+              <div class="addon-catalog-card" id="addonCatalogCard">
+          <div class="addon-catalog-card__header">
+            <div
+              style="
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                flex-wrap: wrap;
+              "
+            >
+              <span class="addon-catalog-card__title"
+                >Catalog Configuration</span
+              >
+              <div class="addon-country-wrap">
+                <label for="addonCountrySelect" class="addon-country-label"
+                  >Region:</label
+                >
+                <input
+                  id="addonCountrySelect"
+                  class="addon-country-select"
+                  list="addonCountryList"
+                  type="text"
+                  autocomplete="off"
+                  spellcheck="false"
+                  placeholder="Auto (Detecting...)"
+                  aria-label="Region"
+                />
+                <datalist id="addonCountryList"></datalist>
+              </div>
+            </div>
+            <span class="addon-catalog-card__badge" id="addonCatalogStatusBadge"
+              >Enabled</span
+            >
+          </div>
+
+          <div
+            class="addon-catalog-card__modes"
+            role="radiogroup"
+            aria-label="Catalog mode"
+          >
+            <label class="addon-catalog-mode-opt">
+              <input
+                type="radio"
+                name="catalogModeRadio"
+                id="catalogModeEnabled"
+                value="enabled"
+                checked
+              />
+              <div class="addon-catalog-mode-opt__info">
+                <strong>PencariMovie Catalogs: Enabled</strong>
+                <span
+                  >Local home rows + Country/Genre catalogs (Movies, Series,
+                  Telegram Files)</span
+                >
+              </div>
+            </label>
+            <label class="addon-catalog-mode-opt">
+              <input
+                type="radio"
+                name="catalogModeRadio"
+                id="catalogModeDisabled"
+                value="disabled"
+              />
+              <div class="addon-catalog-mode-opt__info">
+                <strong>PencariMovie Catalogs: Disabled</strong>
+                <span
+                  >Hide local home rows (Upstream bridged addons and Streams
+                  remain active)</span
+                >
+              </div>
+            </label>
+          </div>
+
+          <div class="addon-catalog-details" id="addonCatalogDetails">
+            <div class="addon-catalog-section">
+              <div class="addon-catalog-section__label">Media Types:</div>
+              <div class="addon-catalog-pill-group">
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="catTypeMovies" checked />
+                  <span>Movies</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="catTypeSeries" checked />
+                  <span>Series</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="catTypeOther" checked />
+                  <span>Telegram Files (Other)</span>
+                </label>
+              </div>
+            </div>
+
+            <div class="addon-catalog-section">
+              <div class="addon-catalog-section__label">
+                <span>Core & Telegram Catalogs:</span>
+                <span class="addon-catalog-quick-links">
+                  <button
+                    type="button"
+                    class="addon-catalog-link-btn"
+                    id="catSelectAllSpecialBtn"
+                  >
+                    All
+                  </button>
+                  <span>·</span>
+                  <button
+                    type="button"
+                    class="addon-catalog-link-btn"
+                    id="catDeselectAllSpecialBtn"
+                  >
+                    None
+                  </button>
+                </span>
+              </div>
+              <div class="addon-catalog-list" id="addonCatalogSpecialList"></div>
+            </div>
+
+            <div class="addon-catalog-section" id="addonCatalogCountrySection">
+              <div class="addon-catalog-section__label">
+                <span>Categories & Countries:</span>
+                <span class="addon-catalog-quick-links">
+                  <button
+                    type="button"
+                    class="addon-catalog-link-btn"
+                    id="catSelectAllBtn"
+                  >
+                    All
+                  </button>
+                  <span>·</span>
+                  <button
+                    type="button"
+                    class="addon-catalog-link-btn"
+                    id="catDeselectAllBtn"
+                  >
+                    None
+                  </button>
+                </span>
+              </div>
+              <div class="addon-catalog-list" id="addonCatalogList"></div>
+            </div>
+          </div>
+
+          <!-- Upstream Addons Section -->
+          <div
+            class="addon-catalog-section"
+            style="
+              margin-top: 14px;
+              border-top: 1px dashed var(--pm-bg-surface-hover);
+              padding-top: 12px;
+            "
+          >
+            <div
+              class="addon-catalog-section__label"
+              style="
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+              "
+            >
+              <span>Upstream Stremio Addons:</span>
+            </div>
+            <label
+              style="
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                margin: 6px 0 8px 0;
+                cursor: pointer;
+                font-size: 0.8rem;
+                color: var(--pm-text-primary);
+              "
+            >
+              <input
+                type="checkbox"
+                id="upstreamEnabledToggle"
+                style="width: 16px; height: 16px; cursor: pointer"
+              />
+              <span
+                >Enable upstream addons
+                <span style="color: var(--pm-text-muted); font-size: 0.72rem"
+                  >(turn off to hide all bridged catalogs)</span
+                ></span
+              >
+            </label>
+            <div
+              id="upstreamAddonsList"
+              style="
+                display: flex;
+                flex-direction: column;
+                gap: 6px;
+                margin-bottom: 8px;
+              "
+            ></div>
+            <div style="display: flex; gap: 6px; align-items: center; width: 100%; box-sizing: border-box;">
+              <input
+                type="text"
+                id="upstreamAddonInput"
+                class="settings-gate__input"
+                style="
+                  flex: 1 1 0%;
+                  min-width: 0;
+                  font-size: 0.78rem;
+                  font-family: monospace;
+                  padding: 6px 10px;
+                  box-sizing: border-box;
+                "
+                placeholder="https://.../manifest.json"
+              />
+              <button
+                type="button"
+                id="upstreamAddonAddBtn"
+                class="settings-gate__btn"
+                style="
+                  flex: 0 0 auto;
+                  padding: 6px 10px;
+                  font-size: 0.78rem;
+                  white-space: nowrap;
+                  display: inline-flex;
+                  align-items: center;
+                  justify-content: center;
+                "
+              >
+                + Add & Validate
+              </button>
+            </div>
+            <div
+              id="upstreamAddonStatus"
+              style="font-size: 0.76rem; margin-top: 5px"
+              class="hidden"
+            ></div>
+          </div>
+
+          <!-- Music Upstreams Section (the addons a backfill fills from) -->
+          <div
+            class="addon-catalog-section"
+            style="
+              margin-top: 14px;
+              border-top: 1px dashed var(--pm-bg-surface-hover);
+              padding-top: 12px;
+            "
+          >
+            <div
+              class="addon-catalog-section__label"
+              style="
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+              "
+            >
+              <span>Music Upstreams:</span>
+            </div>
+            <p
+              style="
+                font-size: 0.74rem;
+                color: var(--pm-text-secondary);
+                margin: 4px 0 8px 0;
+                line-height: 1.35;
+              "
+            >
+              Music addons this server fills a missing track from. A source is
+              tested before it is added: it must serve a manifest, answer a
+              search, and hold at least one lossless rendition.
+            </p>
+            <div
+              id="musicSourcesList"
+              style="
+                display: flex;
+                flex-direction: column;
+                gap: 6px;
+                margin-bottom: 8px;
+              "
+            ></div>
+            <div style="display: flex; gap: 6px; align-items: center; width: 100%; box-sizing: border-box;">
+              <input
+                type="text"
+                id="musicSourceInput"
+                class="settings-gate__input"
+                style="
+                  flex: 1 1 0%;
+                  min-width: 0;
+                  font-size: 0.78rem;
+                  font-family: monospace;
+                  padding: 6px 10px;
+                  box-sizing: border-box;
+                "
+                placeholder="https://.../c"
+              />
+              <button
+                type="button"
+                id="musicSourceAddBtn"
+                class="settings-gate__btn"
+                style="
+                  flex: 0 0 auto;
+                  padding: 6px 10px;
+                  font-size: 0.78rem;
+                  white-space: nowrap;
+                  display: inline-flex;
+                  align-items: center;
+                  justify-content: center;
+                "
+              >
+                + Test & Add
+              </button>
+            </div>
+            <div
+              id="musicSourceStatus"
+              style="font-size: 0.76rem; margin-top: 5px"
+              class="hidden"
+            ></div>
+          </div>
+
+          <!-- ─── Streams Configuration Section (AIOStreams style) ─── -->
+          <div
+            class="addon-catalog-section"
+            style="
+              margin-top: 14px;
+              border-top: 1px dashed var(--pm-bg-surface-hover);
+              padding-top: 12px;
+            "
+          >
+            <div
+              class="addon-catalog-section__label"
+              style="
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+              "
+            >
+              <span>Streams Configuration:</span>
+            </div>
+            <p
+              style="
+                font-size: 0.74rem;
+                color: var(--pm-text-secondary);
+                margin: 4px 0 8px 0;
+                line-height: 1.35;
+              "
+            >
+              Filter, rank, and limit video streams delivered to Nuvio/Stremio
+              (Resolutions, Qualities, Codecs, HDR, File Sizes & Keywords).
+            </p>
+
+            <!-- Resolutions -->
+            <div style="margin-bottom: 8px">
+              <div style="font-size: 0.76rem; color: var(--pm-text-secondary); margin-bottom: 4px">
+                Resolutions:
+              </div>
+              <div class="addon-catalog-pill-group">
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamRes4k" checked />
+                  <span>4K / UHD (2160p)</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamRes1080p" checked />
+                  <span>1080p (FHD)</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamRes720p" checked />
+                  <span>720p (HD)</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamResSd" checked />
+                  <span>SD (480p / 360p)</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamResUnknown" checked />
+                  <span>Unknown</span>
+                </label>
+              </div>
+            </div>
+
+            <!-- Source Qualities -->
+            <div style="margin-bottom: 8px">
+              <div style="font-size: 0.76rem; color: var(--pm-text-secondary); margin-bottom: 4px">
+                Source Qualities:
+              </div>
+              <div class="addon-catalog-pill-group">
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamQualRemux" checked />
+                  <span>BluRay REMUX</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamQualBluray" checked />
+                  <span>BluRay</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamQualWebdl" checked />
+                  <span>WEB-DL</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamQualWebrip" checked />
+                  <span>WEBRip</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamQualHdtv" checked />
+                  <span>HDTV</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamQualCam" checked />
+                  <span>CAM / Telesync</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamExcludeCam" />
+                  <span style="color: var(--pm-status-danger)">Block All CAM</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamExcludeUnplayable" checked />
+                  <span style="color: var(--pm-status-danger)">Exclude Unplayable</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamExcludePartTitle" checked />
+                  <span style="color: var(--pm-status-danger)">Exclude Part Titles</span>
+                </label>
+              </div>
+            </div>
+
+            <!-- Video Encodes & Visual Tags -->
+            <div style="margin-bottom: 8px">
+              <div style="font-size: 0.76rem; color: var(--pm-text-secondary); margin-bottom: 4px">
+                Encodes & Formats:
+              </div>
+              <div class="addon-catalog-pill-group">
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamEncHevc" checked />
+                  <span>HEVC (H.265)</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamEncAvc" checked />
+                  <span>AVC (H.264)</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamEncAv1" checked />
+                  <span>AV1</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamVisHdr" checked />
+                  <span>HDR / HDR10+</span>
+                </label>
+                <label class="addon-catalog-pill">
+                  <input type="checkbox" id="streamVisDv" checked />
+                  <span>Dolby Vision</span>
+                </label>
+              </div>
+            </div>
+
+            <!-- Priority & Stream Limits -->
+            <div
+              style="
+                display: flex;
+                gap: 10px;
+                flex-wrap: wrap;
+                align-items: center;
+                margin-bottom: 8px;
+              "
+            >
+              <div style="display: flex; align-items: center; gap: 5px">
+                <label
+                  for="streamPreferredRes"
+                  style="font-size: 0.76rem; color: var(--pm-text-secondary)"
+                  >Priority:</label
+                >
+                <select
+                  id="streamPreferredRes"
+                  class="settings-gate__input"
+                  style="
+                    padding: 4px 6px;
+                    font-size: 0.76rem;
+                    width: auto;
+                    background: var(--pm-bg-canvas);
+                    border: 1px solid var(--pm-border-strong);
+                    border-radius: 4px;
+                    color: var(--pm-text-primary);
+                  "
+                >
+                  <option value="auto">Auto (Highest First)</option>
+                  <option value="4k">4K (2160p)</option>
+                  <option value="1080p">1080p (FHD)</option>
+                  <option value="720p">720p (HD)</option>
+                  <option value="sd">SD (480p/360p)</option>
+                </select>
+              </div>
+
+              <div style="display: flex; align-items: center; gap: 5px">
+                <label
+                  for="streamMaxPerRes"
+                  style="font-size: 0.76rem; color: var(--pm-text-secondary)"
+                  >Max / Resolution:</label
+                >
+                <select
+                  id="streamMaxPerRes"
+                  class="settings-gate__input"
+                  style="
+                    padding: 4px 6px;
+                    font-size: 0.76rem;
+                    width: auto;
+                    background: var(--pm-bg-canvas);
+                    border: 1px solid var(--pm-border-strong);
+                    border-radius: 4px;
+                    color: var(--pm-text-primary);
+                  "
+                >
+                  <option value="0">All Available</option>
+                  <option value="1">1</option>
+                  <option value="2">2</option>
+                  <option value="3">3</option>
+                  <option value="5">5</option>
+                  <option value="10">10</option>
+                </select>
+              </div>
+
+              <div style="display: flex; align-items: center; gap: 5px">
+                <label
+                  for="streamMaxTotal"
+                  style="font-size: 0.76rem; color: var(--pm-text-secondary)"
+                  >Max Total:</label
+                >
+                <select
+                  id="streamMaxTotal"
+                  class="settings-gate__input"
+                  style="
+                    padding: 4px 6px;
+                    font-size: 0.76rem;
+                    width: auto;
+                    background: var(--pm-bg-canvas);
+                    border: 1px solid var(--pm-border-strong);
+                    border-radius: 4px;
+                    color: var(--pm-text-primary);
+                  "
+                >
+                  <option value="0">Default (100)</option>
+                  <option value="10">10</option>
+                  <option value="20">20</option>
+                  <option value="30">30</option>
+                  <option value="50">50</option>
+                </select>
+              </div>
+
+              <div style="display: flex; align-items: center; gap: 5px">
+                <label
+                  for="streamMinSizeMb"
+                  style="font-size: 0.76rem; color: var(--pm-text-secondary)"
+                  >Min Size:</label
+                >
+                <input
+                  type="number"
+                  id="streamMinSizeMb"
+                  min="0"
+                  max="10000"
+                  placeholder="MB"
+                  class="settings-gate__input"
+                  style="
+                    padding: 4px 6px;
+                    font-size: 0.76rem;
+                    width: 68px;
+                    background: var(--pm-bg-canvas);
+                    border: 1px solid var(--pm-border-strong);
+                    border-radius: 4px;
+                    color: var(--pm-text-primary);
+                  "
+                />
+              </div>
+
+              <div style="display: flex; align-items: center; gap: 5px">
+                <label
+                  for="streamMaxSizeGb"
+                  style="font-size: 0.76rem; color: var(--pm-text-secondary)"
+                  >Max Size:</label
+                >
+                <input
+                  type="number"
+                  id="streamMaxSizeGb"
+                  min="0"
+                  max="100"
+                  placeholder="GB"
+                  class="settings-gate__input"
+                  style="
+                    padding: 4px 6px;
+                    font-size: 0.76rem;
+                    width: 68px;
+                    background: var(--pm-bg-canvas);
+                    border: 1px solid var(--pm-border-strong);
+                    border-radius: 4px;
+                    color: var(--pm-text-primary);
+                  "
+                />
+              </div>
+            </div>
+
+            <!-- Keyword Filters -->
+            <div
+              style="
+                display: flex;
+                flex-direction: column;
+                gap: 6px;
+                margin-top: 6px;
+              "
+            >
+              <div style="display: flex; gap: 6px; align-items: center">
+                <label
+                  for="streamExcludedKeywords"
+                  style="font-size: 0.74rem; color: var(--pm-status-danger); min-width: 105px"
+                  >Exclude Keywords:</label
+                >
+                <input
+                  type="text"
+                  id="streamExcludedKeywords"
+                  placeholder="e.g. cam, sample, trailer, dub"
+                  class="settings-gate__input"
+                  style="
+                    padding: 4px 8px;
+                    font-size: 0.74rem;
+                    flex: 1;
+                    background: var(--pm-bg-canvas);
+                    border: 1px solid var(--pm-border-strong);
+                    border-radius: 4px;
+                    color: var(--pm-text-primary);
+                  "
+                />
+              </div>
+              <div style="display: flex; gap: 6px; align-items: center">
+                <label
+                  for="streamRequiredKeywords"
+                  style="font-size: 0.74rem; color: var(--pm-status-online); min-width: 105px"
+                  >Require Keywords:</label
+                >
+                <input
+                  type="text"
+                  id="streamRequiredKeywords"
+                  placeholder="e.g. malaysub, 10bit (optional)"
+                  class="settings-gate__input"
+                  style="
+                    padding: 4px 8px;
+                    font-size: 0.74rem;
+                    flex: 1;
+                    background: var(--pm-bg-canvas);
+                    border: 1px solid var(--pm-border-strong);
+                    border-radius: 4px;
+                    color: var(--pm-text-primary);
+                  "
+                />
+              </div>
+            </div>
+          </div>
+
+          <div class="addon-catalog-save-row">
+            <button
+              type="button"
+              id="catSaveSettingsBtn"
+              class="settings-gate__btn addon-catalog-save-btn"
+              style="
+                width: 100%;
+                padding: 10px 16px;
+                font-size: 0.9rem;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                gap: 6px;
+                white-space: normal;
+                text-align: center;
+              "
+            >
+              Save Addon Configuration
+            </button>
+            <span id="catSaveStatus" class="addon-catalog-status-msg hidden"
+              >Saved!</span
+            >
+          </div>
+        </div>
+              <div class="addon-catalog-card" id="addonSettingsJsonCard">
+          <div class="addon-catalog-card__header">
+            <span class="addon-catalog-card__title">Settings JSON</span>
+          </div>
+          <div
+            style="
+              font-size: 0.72rem;
+              color: var(--pm-text-secondary);
+              line-height: 1.5;
+              margin-bottom: 6px;
+            "
+          >
+            Everything in this panel, as one line of JSON. Copy it to set up
+            another install (Arch, Windows, Android) — paste it back here and
+            press <strong>Apply pasted JSON</strong> — or paste it into a
+            <code>PM_CATALOG_SETTINGS</code> environment variable on a host with
+            an ephemeral disk (Render, Docker without a volume).
+          </div>
+          <textarea
+            id="catSettingsJson"
+            rows="3"
+            spellcheck="false"
+            placeholder="Copy to back up — or paste a saved settings JSON here and press Apply pasted JSON."
+            style="
+              width: 100%;
+              box-sizing: border-box;
+              min-height: 52px;
+              max-height: 140px;
+              resize: vertical;
+              font-family: monospace;
+              font-size: 0.68rem;
+              line-height: 1.4;
+              color: var(--pm-text-primary);
+              background: var(--pm-bg-canvas);
+              border: 1px solid var(--pm-border-strong);
+              border-radius: 6px;
+              padding: 8px;
+            "
+          ></textarea>
+          <div class="addon-catalog-save-row" style="margin-top: 8px">
+            <button
+              type="button"
+              id="catCopySettingsBtn"
+              class="settings-gate__btn addon-catalog-save-btn"
+              style="padding: 8px 12px; font-size: 0.82rem"
+            >
+              Copy JSON
+            </button>
+            <button
+              type="button"
+              id="catApplySettingsBtn"
+              class="settings-gate__btn addon-catalog-save-btn"
+              style="padding: 8px 12px; font-size: 0.82rem"
+            >
+              Apply pasted JSON
+            </button>
+          </div>
+          <span id="catSettingsIoStatus" class="addon-catalog-status-msg"></span>
+        </div>
+          </section>
+
+          <!-- ─── System ─────────────────────────────────────────── -->
+          <section class="pm-panel hidden" id="tab-system" data-panel="system">
+            <h2 class="pm-h2">Security</h2>
+            <p class="pm-lede">
+              The server password guards this dashboard when it is reachable from
+              outside this machine. Diagnostics reports never contain a bot token.
+            </p>
+              <!-- Change Password Box -->
+          <div class="settings-gate__addon-box" style="margin-top: 14px">
+            <span>Change Password</span>
+            <div
+              style="
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+                margin-top: 10px;
+              "
+            >
+              <input
+                type="password"
+                id="changePwCurrent"
+                class="settings-gate__input"
+                placeholder="Current Password"
+                autocomplete="current-password"
+                style="padding: 8px 12px; font-size: 0.85rem"
+              />
+              <input
+                type="password"
+                id="changePwNew"
+                class="settings-gate__input"
+                placeholder="New Password (min. 4 characters)"
+                autocomplete="new-password"
+                style="padding: 8px 12px; font-size: 0.85rem"
+              />
+              <button
+                type="button"
+                id="changePwBtn"
+                class="settings-gate__btn"
+                style="padding: 8px 14px; font-size: 0.85rem"
+              >
+                Update Password
+              </button>
+              <div
+                id="changePwStatus"
+                class="settings-gate__status"
+                style="margin: 0"
+              ></div>
+            </div>
+          </div>
+              <div
+            id="diagnosticsSection"
+            style="
+              margin-bottom: 12px;
+              padding: 10px 12px;
+              background: var(--pm-bg-surface);
+              border: 1px solid var(--pm-border-subtle);
+              border-radius: 8px;
+              text-align: left;
+              box-sizing: border-box;
+            "
+          >
+            <label
+              style="
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                font-size: 0.85rem;
+                cursor: pointer;
+              "
+            >
+              <input
+                type="checkbox"
+                id="autoReportToggle"
+                checked
+                style="
+                  width: 16px;
+                  height: 16px;
+                  accent-color: var(--pm-accent);
+                  flex: 0 0 auto;
+                "
+              />
+              <span>Auto-send Diagnostic & Crash Reports</span>
+            </label>
+            <div style="font-size: 0.72rem; color: var(--pm-text-muted); margin: 6px 0 8px 0">
+              Sends the device id, model, OS and the error details when the
+              server crashes, hangs, or a title fails to play. No bot token is
+              ever sent.
+            </div>
+            <div style="display: flex; gap: 6px; flex-wrap: wrap">
+              <button
+                type="button"
+                id="diagSelfTestBtn"
+                class="settings-gate__btn"
+                style="
+                  flex: 1 1 120px;
+                  padding: 8px 10px;
+                  font-size: 0.78rem;
+                  background: var(--pm-bg-surface-elevated);
+                  border: 1px solid var(--pm-border-subtle);
+                "
+              >
+                Run Self-Test
+              </button>
+              <button
+                type="button"
+                id="diagReportBtn"
+                class="settings-gate__btn"
+                style="
+                  flex: 1 1 120px;
+                  padding: 8px 10px;
+                  font-size: 0.78rem;
+                  background: var(--pm-bg-surface-elevated);
+                  border: 1px solid var(--pm-border-subtle);
+                "
+              >
+                Send Reports
+              </button>
+            </div>
+            <div
+              id="diagStatus"
+              style="
+                font-size: 0.72rem;
+                color: var(--pm-text-muted);
+                margin-top: 8px;
+                white-space: pre-wrap;
+              "
+            ></div>
+          </div>
+          </section>
+
+        </div>
+      </main>
+
+      <footer class="pm-footer">
+        <div class="pm-container">PencariMovie Server &middot; Single Rust Executable</div>
+      </footer>
+    </div>
+
+    <!-- ─── Core Scripts ─────────────────────────────────────────── -->
+    <script src="boot-guard.js?v=20261009pm10"></script>
+    <!-- fetch / Object.entries / closest / AbortController for old WebViews
+         (Android 5.1 = Chromium 39). No-ops on modern engines. -->
+    <script src="assets/runtime/legacy-polyfills.js?v=20261009pm10"></script>
+    <script defer src="app.js?v=20261111multitoken2"></script>
+    <script defer src="dashboard.js?v=20261111multitoken2"></script>
+  </body>
+</html>

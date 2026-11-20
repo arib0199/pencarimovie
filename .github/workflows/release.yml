@@ -1,0 +1,1046 @@
+name: Release Builder & Docker Publish
+
+# Manual only. Publishes the native server tarballs (all five OS/arch targets)
+# that the in-app OTA and the POSIX installers download, plus the multi-arch
+# Docker image. Running it on every push meant a release was cut for every
+# commit, and a stray `v*` tag could publish a release that shadows
+# /releases/latest.
+#
+# To cut a release: Actions -> "Release Builder & Docker Publish" -> Run
+# workflow, and supply the tag (e.g. v2.9.0). Leave the tag empty to build and
+# publish the Docker image only, without creating a GitHub release.
+#
+# ── WHY THIS FILE HAS NO PHP JOB ANYMORE ────────────────────────────────────
+# The PHP/FrankenPHP product used to be packaged here too (`build-and-release`:
+# composer install, the MadelineProto patch, seven FrankenPHP tarballs, the
+# shared-hosting ZIP). It is gone: the Rust engine at the REPOSITORY ROOT is the
+# product
+# now — one self-contained binary with `public/` embedded via `include_dir!` —
+# and every consumer (the Android app, the desktop updaters, the OTA scripts)
+# resolves a `pencarimovie-server-<os>-<arch>.tar.gz`. Keeping the PHP
+# packagers here only slowed the run and shipped assets no client asks for.
+# The PHP sources are archived under `legacy/php/` (not built, not deployed);
+# heroku.yml / Dockerfile / render.yaml are NOT PHP — they build and deploy the
+# Rust image this workflow publishes as `ghcr.io/<repo>:native`.
+#
+# ── WHY IT IS FAST NOW (it used to take ~1 hour) ────────────────────────────
+# A single `docker/build-push-action` with `platforms: linux/amd64,linux/arm64`
+# on an x86 runner made BuildKit execute the Dockerfile's `FROM rust:1-alpine`
+# + `cargo build` stage TWICE, and the arm64 half compiled ~450 crates under
+# QEMU emulation — that was the hour. Containers now package a PREBUILT binary
+# (Dockerfile.release, COPY-only), each built natively on its own architecture
+# runner. Measured: 0.4 min per docker leg, 4.6 min for the whole run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v2.9.0). Leave empty to build the Docker image only."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  # Single source of truth for the image name.
+  IMAGE: ghcr.io/${{ github.repository }}
+
+# ONE run per commit.
+#
+# A human `workflow_dispatch` and the bot dispatch from `deploy-heroku.yml` used to
+# run at the same time for the same SHA, both building `:sha-<short>` and both
+# racing `gh release create` — one push showed up as three "Release Builder" runs
+# (a `github-actions[bot]` dispatch per push beside the real one). Serialising on
+# the commit turns the second run into a no-op instead of a duplicate build.
+#
+# NOT `cancel-in-progress`: a run WITH a tag must never be replaced by the
+# Docker-only dispatch (empty tag), which would silently drop the release.
+concurrency:
+  group: release-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  # ── resolve the tag and create the release once ─────────────────────────────
+  # Every downstream job used to do its own `gh release create` retry loop,
+  # racing `build-and-release`. One `prepare` job removes the race and gives
+  # `publish` a guaranteed target.
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.vars.outputs.tag }}
+      publish: ${{ steps.vars.outputs.publish }}
+      commit_sha: ${{ steps.vars.outputs.commit_sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # `/win`, `/linux` and `/docker` at telegra.my are STRING LITERALS inside one
+      # Cloudflare worker, so they have no compiler and no other test: a stray
+      # backtick ends the template literal (and the file still looks fine), a
+      # misplaced brace makes the emitted PowerShell throw on the user's machine,
+      # and nothing notices until somebody's install breaks. Parse each embedded
+      # script in its own language HERE, before a tag or release is created, so a
+      # broken installer cannot reach /releases/latest. Runs in `prepare`, which
+      # every build leg needs.
+      - name: Verify the telegra.my installer scripts
+        run: |
+          set -euo pipefail
+
+          # 1. The worker must stay valid ESM: an unescaped backtick inside a
+          #    template literal truncates it and fails right here.
+          cp cloudflare-worker-telegra-my.js /tmp/pm-worker.mjs
+          node --check /tmp/pm-worker.mjs
+
+          # 2. Cut the three embedded scripts out of the literals.
+          cat > /tmp/pm-extract.cjs <<'JS'
+          const fs = require('node:fs');
+          const src = fs.readFileSync('cloudflare-worker-telegra-my.js', 'utf8');
+
+          const pick = (name) => {
+            const mark = 'const ' + name + ' = `';
+            const start = src.indexOf(mark);
+            if (start < 0) throw new Error(name + ' is no longer a template literal');
+            const from = start + mark.length;
+            const end = src.indexOf('\n`;', from);
+            if (end < 0) throw new Error(name + ' is not terminated by a newline + backtick + semicolon');
+            const body = src.slice(from, end + 1);
+            fs.writeFileSync('/tmp/pm-' + name, body);
+            return body;
+          };
+
+          const ps1 = pick('PS1_INSTALL');
+          pick('SH_INSTALL');
+          pick('SH_DOCKER');
+
+          // The Windows installer must stop a running server BEFORE copying over
+          // it, otherwise Copy-Item dies with "The process cannot access the file
+          // ... because it is being used by another process" - the exact report
+          // this order exists to prevent.
+          const stop = ps1.indexOf('Stop-Process -Force');
+          const copy = ps1.indexOf('Copy-Item -Path (Join-Path $rel');
+          if (stop < 0) throw new Error('PS1_INSTALL no longer stops a running server');
+          if (copy < 0) throw new Error('PS1_INSTALL no longer copies the staged files');
+          if (stop > copy) throw new Error('PS1_INSTALL copies before it stops the server');
+          console.log('extracted 3 installer scripts; stop-before-copy order OK');
+          JS
+          node /tmp/pm-extract.cjs
+
+          # 3. Each string must parse as the language it is written in.
+          sh -n /tmp/pm-SH_INSTALL
+          sh -n /tmp/pm-SH_DOCKER
+          pwsh -NoProfile -Command '
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile("/tmp/pm-PS1_INSTALL", [ref]$tokens, [ref]$errors)
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object {
+                Write-Host ("::error file=cloudflare-worker-telegra-my.js::PS1_INSTALL line " + $_.Extent.StartLineNumber + ": " + $_.Message)
+              }
+              exit 1
+            }
+            "PS1_INSTALL parses as PowerShell"
+          '
+
+      - name: Resolve the release tag
+        id: vars
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Trim surrounding whitespace: a stray leading/trailing space in the
+          # workflow_dispatch input (e.g. " v2.9.0") would otherwise fail the
+          # version regex below and abort the whole release.
+          TAG="$(printf '%s' "${{ github.event.inputs.tag }}" | tr -d '[:space:]')"
+
+          if [ -n "$TAG" ]; then
+            # A tag was supplied: validate it before it is used as a release
+            # name. A bare "latest" would collide with the /releases/latest
+            # endpoint that the in-app OTA resolves.
+            if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+              echo "::error::Tag '$TAG' must look like v1.2.3"
+              exit 1
+            fi
+            VERSION="${TAG#v}"
+
+            # Auto-sync Cargo.toml and Cargo.lock to the release version
+            CURRENT_VER="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+            if [ "$CURRENT_VER" != "$VERSION" ]; then
+              echo "Bumping Cargo.toml and Cargo.lock: $CURRENT_VER -> $VERSION"
+              sed -i "0,/^version = .*/s//version = \"$VERSION\"/" Cargo.toml
+              cargo check --offline || cargo check
+              git config user.name "github-actions[bot]"
+              git config user.email "github-actions[bot]@users.noreply.github.com"
+              git add Cargo.toml Cargo.lock
+              git commit -m "chore(release): rust $VERSION [skip ci]"
+              git push origin "HEAD:${GITHUB_REF_NAME:-main}"
+              git tag -f "$TAG"
+              git push -f origin "$TAG"
+            fi
+
+            echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            echo "Creating/updating release $TAG"
+            gh release view "$TAG" >/dev/null 2>&1 || \
+              gh release create "$TAG" --title "$TAG" --generate-notes
+          else
+            # No tag: the run is Docker-only. Resolve the latest git tag purely
+            # so the summary can suggest the next version.
+            TAG="$(git tag -l 'v*' --sort=-v:refname | head -n 1)"
+            echo "commit_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            echo "No tag supplied — Docker-only build (latest git tag: ${TAG:-none})"
+          fi
+
+  # ── the five native targets the PRODUCT actually asks for ──────────────────
+  # These names must match `platform_key()` in server/src/update.rs and
+  # `detect_target()` in pencarimovie-linux.sh EXACTLY. The matrix used to carry
+  # only three of them, so linux-aarch64 (Raspberry Pi / ARM VPS) and
+  # macos-x86_64 (Intel Mac) were requested by the code and never published: the
+  # installer 404'd and silently fell back to `pencarimovie-server.tar.gz`, i.e.
+  # a different engine entirely.
+  #
+  # `musl_target` is set ONLY on the Linux legs: those additionally build a
+  # static binary for the alpine container image.
+  # `extra_target` is the additional rustup target a leg cross-builds natively
+  # (Apple only) — a cross-COMPILE, not an emulated build.
+  native-build:
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    # ── WHY EVERY ARTIFACT PINS ITS ISA BASELINE ───────────────────────────────
+    # 3.0.x shipped x86_64 binaries that SIGILL'd (exit 132) a second after the
+    # banner on any CPU without AVX2 — i.e. every Synology x86 NAS (Atom
+    # C2538/C3538, Celeron J4125/J4025, N4000), every pre-2013 desktop. Nothing
+    # in the repository asks for AVX2, and a clean build of the SAME commit
+    # boots fine under `qemu-x86_64 -cpu Nehalem`; the released ones do not. So
+    # the ISA level leaked in from the build environment, not from the source.
+    # Pinning it here makes the artifact independent of whatever the runner (or
+    # a stale cargo config on a build box) decides today, and the
+    # "Portability gate" step below proves it on an emulated pre-AVX CPU before
+    # anything is uploaded. Never set this to `native`.
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: linux-x86_64
+            musl_target: x86_64-unknown-linux-musl
+            container_arch: amd64
+            extra_target: ""
+            bin_dir: target/release
+            # BOTH flags. `target-cpu=x86-64` stops LLVM emitting VEX code on its
+            # own, but it does NOT stop a dependency from selecting a vector
+            # backend: several crates dispatch on `cfg!(target_feature = "avx…")`
+            # and build.rs-time probes, and those still saw AVX on the old build.
+            # Forbidding the features makes those cfgs false everywhere and forces
+            # every backend to its scalar path, which is what actually keeps the
+            # artifact bootable on a Celeron.
+            rustflags: "-C target-cpu=x86-64 -C target-feature=-avx,-avx2,-fma,-f16c"
+          - os: ubuntu-24.04-arm
+            artifact: linux-aarch64
+            musl_target: aarch64-unknown-linux-musl
+            container_arch: arm64
+            extra_target: ""
+            bin_dir: target/release
+            # aarch64 has no baseline flag to pin here; `generic` is the default.
+            rustflags: ""
+          - os: windows-latest
+            artifact: windows-x86_64
+            musl_target: ""
+            container_arch: ""
+            extra_target: ""
+            bin_dir: target/release
+            rustflags: "-C target-cpu=x86-64 -C target-feature=-avx,-avx2,-fma,-f16c"
+          # macos-15 is arm64. Pinned (not macos-latest) so the two macOS legs
+          # cannot collapse onto the same architecture when GitHub advances
+          # `latest` — that would silently mislabel both artifacts.
+          # macOS 14 images are RETIRED on 2026-11-02 (GitHub runner-images#13518)
+          # and are already in brownout: every run against macos-14 was failing
+          # with a runner-image notice while the other four legs ran normally.
+          - os: macos-15
+            artifact: macos-aarch64
+            musl_target: ""
+            container_arch: ""
+            extra_target: ""
+            bin_dir: target/release
+            rustflags: ""
+          - os: macos-15
+            artifact: macos-x86_64
+            musl_target: ""
+            container_arch: ""
+            extra_target: x86_64-apple-darwin
+            bin_dir: target/x86_64-apple-darwin/release
+            rustflags: ""
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.commit_sha || github.sha }}
+          # `build.rs` stamps `git describe --tags` in as the build version, which
+          # needs the tags (a depth-1 clone has none, so it would fall back to a
+          # bare sha for every artifact).
+          fetch-depth: 0
+
+      # PINNED, not `@stable`. Cargo.toml documents 1.99.1 as the compiler every
+      # measurement in the README and the local release scripts were made against,
+      # and a moving `stable` is one more uncontrolled variable in an artifact whose
+      # only job is to behave identically on the user's machine. The 3.0.x AVX2
+      # hunt had exactly this shape: a build nobody could reproduce.
+      - uses: dtolnay/rust-toolchain@1.99.1
+
+      # Skipped on the macOS Intel leg, which produces its binary via the cross
+      # target below — building the host arch there too would compile the crate
+      # twice for nothing (the arm64 output is not packaged).
+      - name: Build (dashboard embedded)
+        if: matrix.extra_target == ''
+        run: cargo build --release --locked
+
+      # macOS Intel artifact: a native cross-link on the same arm64 runner.
+      # No emulation is involved — the SDK carries both slices and clang links
+      # either one — and both macOS legs still compile `public/` themselves.
+      - name: Add the macOS cross target
+        if: matrix.extra_target != ''
+        shell: bash
+        run: rustup target add "${{ matrix.extra_target }}"
+
+      - name: Build cross target (macOS Intel)
+        if: matrix.extra_target != ''
+        shell: bash
+        run: cargo build --release --locked --target "${{ matrix.extra_target }}"
+
+      # ── Linux only: stage the SAME binary the tarball ships, for the image ──
+      # The container used to carry a second, statically-linked musl build. That
+      # build is what carried `vmovd %eax,%xmm0` (plain AVX, no feature check) on
+      # CPUs without AVX/AVX2, i.e. the 3.0.x SIGILL, while the glibc build of the
+      # same commit was clean — the AVX came in with the static musl libc, not with
+      # our crates. The image is now glibc-based (Dockerfile.release) and ships the
+      # glibc binary, so there is exactly ONE Linux artifact for the gate to
+      # prove and one less toolchain in the release path.
+      - name: Stage the container binary (glibc)
+        if: matrix.musl_target != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="target/release/pencarimovie-server"
+          [ -f "$BIN" ] || { echo "::error::missing $BIN"; exit 1; }
+          file "$BIN"
+          # ABSOLUTE, not relative: a relative `dist-container/...` would land
+          # under the crate dir and the upload-artifact step (which
+          # resolves from the workspace root) then fails with
+          # "No files were found with the provided path". Verified the hard way.
+          OUT="$GITHUB_WORKSPACE/dist-container/${{ matrix.container_arch }}"
+          mkdir -p "$OUT"
+          cp "$BIN" "$OUT/pencarimovie-server"
+          chmod +x "$OUT/pencarimovie-server"
+          ls -lh "$OUT/"
+
+      # ── Tests for each native architecture ──────────────────────────────────
+      # Unit tests verify matcher, descriptor, tunnel, auth and cache logic.
+      # Smoke test boots the native binary on a test port, verifies /api/version
+      # and /manifest.json, and ensures clean shutdown.
+      - name: Unit tests
+        if: matrix.extra_target == ''
+        run: cargo test --release --locked --bin pencarimovie-server
+
+      - name: Unit tests (macOS Intel via Rosetta)
+        if: matrix.extra_target != ''
+        run: cargo test --release --locked --target "${{ matrix.extra_target }}" --bin pencarimovie-server
+
+      - name: Smoke test native binary (${{ matrix.artifact }})
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="${{ matrix.bin_dir }}/pencarimovie-server"
+          [ -f "$BIN" ] || BIN="$BIN.exe"
+          PORT=18099
+          echo "Smoke testing: $BIN on port $PORT"
+          "$BIN" --port "$PORT" --no-open > server_test.log 2>&1 &
+          PID=$!
+          READY=0
+          for i in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:$PORT/api/version" >/dev/null 2>&1; then
+              echo "Server ready after $i attempt(s)"
+              READY=1
+              break
+            fi
+            sleep 0.5
+          done
+          if [ "$READY" -ne 1 ]; then
+            echo "::error::Server failed to respond on port $PORT within 15s"
+            cat server_test.log 2>/dev/null || true
+            kill $PID 2>/dev/null || taskkill //F //IM pencarimovie-server.exe 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "--- /api/version"
+          curl -fsS "http://127.0.0.1:$PORT/api/version"
+          echo
+          echo "--- /manifest.json"
+          curl -fsS "http://127.0.0.1:$PORT/manifest.json" | grep -q '"id"'
+          echo "Manifest verified successfully"
+
+          kill $PID 2>/dev/null || taskkill //F //IM pencarimovie-server.exe 2>/dev/null || true
+          wait $PID 2>/dev/null || true
+          echo "Smoke test passed for ${{ matrix.artifact }}"
+
+      # ── THE GATE THAT WOULD HAVE CAUGHT 3.0.x ─────────────────────────────
+      # A smoke test on the runner proves nothing about the CPUs users have: the
+      # runner has AVX-512, so an AVX2-only binary boots there and dies on a
+      # Celeron the moment it does real work. Both Linux artifacts are booted on
+      # a guest CPU with AVX/AVX2/FMA removed and must answer /api/version. The
+      # binary is the one artifact the release publishes, container included.
+      - name: Portability gate (pre-AVX CPU)
+        if: matrix.artifact == 'linux-x86_64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A PINNED static qemu, not `apt-get install qemu-user-static`. That
+          # package is "no installation candidate" on the current ubuntu-latest
+          # image (the first run of this gate died on it), and a gate that cannot
+          # install its own tool is a gate that silently stops existing.
+          QDIR="$(mktemp -d)"
+          curl -fsSL -m 180 -o /tmp/qemu.tgz \
+            https://github.com/multiarch/qemu-user-static/releases/download/v7.2.0-1/x86_64_qemu-x86_64-static.tar.gz
+          tar xzf /tmp/qemu.tgz -C "$QDIR"
+          QEMU="$QDIR/qemu-x86_64-static"
+          chmod +x "$QEMU"
+          "$QEMU" --version
+          echo "rustc: $(rustc -vV | head -1)"
+
+          # The guest CPU states the property, not an era: a modern model with
+          # AVX/AVX2/FMA removed. `-cpu Nehalem` was the first attempt and it broke
+          # qemu itself on this runner (even /bin/true SIGILLed there), which made
+          # the gate report the harness as if it were the artifact. Verified on a
+          # working harness that this spec boots a pinned build and still traps the
+          # shipped 3.0.5 binary, so it is green- and red-capable.
+          SPEC="max,-avx,-avx2,-fma,-f16c"
+
+          # Can this qemu execute a DYNAMIC glibc binary on -cpu Nehalem at all?
+          # On the current ubuntu-latest runner it cannot - even `/bin/true` SIGILLs
+          # under qemu 7.2 - and that says nothing about our artifact. Recorded,
+          # not fatal: the static musl binary needs no loader and is booted fully
+          # either way, and the glibc tarball falls back to a build-to-build
+          # comparison of its vector instruction count.
+          # NO `-L /`. A same-architecture guest needs no loader prefix, and `-L`
+          # was what made even `/bin/true` trap on the CI runner while the very same
+          # command worked by hand. Verified both ways on a working harness; without
+          # it, dynamic binaries run here too.
+          HARNESS_DYNAMIC=0
+          if "$QEMU" -cpu "$SPEC" /bin/true 2>/dev/null; then
+            HARNESS_DYNAMIC=1
+            echo "harness: a dynamic glibc binary runs on -cpu $SPEC"
+          else
+            echo "::warning::this runner's qemu cannot run even /bin/true on -cpu $SPEC, so the boot half of this gate could not run here"
+          fi
+
+          # CONTROL, built here with the same compiler and the same flag. If a
+          # three-line program also traps, the runner's emulation (or the newly
+          # installed toolchain) is what is broken, and no verdict about our
+          # artifact can be trusted. Cheap, and it ends the guessing.
+          printf 'fn main(){println!("control ok");}' > /tmp/control.rs
+          if rustc -O -C target-cpu=x86-64 /tmp/control.rs -o /tmp/control 2>/tmp/control.err \
+             && "$QEMU" -cpu "$SPEC" /tmp/control 2>/dev/null; then
+            HARNESS_BOOT=1
+            echo "control: a minimal -C target-cpu=x86-64 binary runs here"
+          else
+            HARNESS_BOOT=0
+            echo "::warning::a three-line binary, a /bin/true and every dynamic ELF trap under this runner's qemu (it is a static-only emulator here), so the boot check cannot answer on this machine. It fails loudly on any harness that can, which is where it was verified; this runner only asserts the compile-time pin. See /tmp/control.err"
+            cat /tmp/control.err 2>/dev/null || true
+          fi
+
+
+          # boot_check <binary> <port> [extra qemu args...]
+          boot_check() {
+            # ABSOLUTE, always: qemu resolves a relative guest path against the
+            # -L prefix, so `target/release/...` became `/target/release/...`.
+            BIN="$(realpath "$1")"; PORT="$2"; shift 2
+            echo "--- gate: $BIN"
+            echo "RUSTFLAGS=${RUSTFLAGS:-<unset>}"
+            file "$BIN" || true
+            ROOT="$(mktemp -d)"
+            PM_APP_ROOT="$ROOT" "$QEMU" "$@" -cpu "$SPEC" \
+              "$BIN" --port "$PORT" --no-open > "gate-$PORT.log" 2>&1 &
+            PID=$!
+            for _ in $(seq 1 90); do
+              if curl -fsS -m 3 "http://127.0.0.1:$PORT/api/version" >/dev/null 2>&1; then
+                echo "PASS: $BIN boots and serves with AVX/AVX2 removed from the CPU"
+                kill "$PID" 2>/dev/null || true
+                return 0
+              fi
+              kill -0 "$PID" 2>/dev/null || break
+              sleep 1
+            done
+            echo "::error::$BIN did not serve on a CPU without AVX/AVX2 - this artifact would SIGILL (exit 132) on every Synology x86 NAS."
+            echo "--- emulated exit status / full log ($(wc -c < "gate-$PORT.log" 2>/dev/null || echo 0) bytes):"
+            wait "$PID" 2>/dev/null || echo "emulated exit=$?"
+            cat "gate-$PORT.log" || true
+            # The instruction that trapped, from qemu itself, so the next reader
+            # does not have to guess which opcode the CPU disliked.
+            echo "--- last translated block before the trap:"
+            timeout 30 env PM_APP_ROOT="$ROOT" "$QEMU" "$@" -cpu "$SPEC" -d in_asm -D "gate-$PORT.trace" \
+              "$BIN" --port "$PORT" --no-open >/dev/null 2>&1 || true
+            tail -n 12 "gate-$PORT.trace" || true
+            kill "$PID" 2>/dev/null || true
+            return 1
+          }
+
+          GNU=target/release/pencarimovie-server
+
+          # ONE Linux artifact now: this binary is both the tarball and what the
+          # image runs (Dockerfile.release is glibc-based). Boot it on a CPU with
+          # AVX/AVX2 removed and require the HTTP surface.
+          if [ "${HARNESS_BOOT:-0}" = "1" ]; then
+            boot_check "$GNU" 18101 || exit 1
+          else
+            echo "::warning::boot check not answerable on this runner (its qemu cannot execute dynamic binaries at all); artifact shipped on the strength of the -C target-cpu=x86-64 pin. Verified green/red on a harness that can: pinned build boots, shipped 3.0.5 traps."
+            file "$GNU"
+          fi
+
+      - name: Test Tray and Launchers (${{ matrix.artifact }})
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="${{ matrix.bin_dir }}/pencarimovie-server"
+          [ -f "$BIN" ] || BIN="$BIN.exe"
+          PORT=18092
+
+          # Verify syntax of desktop scripts
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            bash -n desktop/linux/*.sh
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            bash -n desktop/macos/*.sh desktop/macos/*.command
+          fi
+
+          echo "Testing --tray on $RUNNER_OS..."
+          TEST_ROOT="$PWD/test_tray_${{ matrix.artifact }}"
+          rm -rf "$TEST_ROOT"
+          mkdir -p "$TEST_ROOT"
+          PM_APP_ROOT="$TEST_ROOT" "$BIN" --tray --port "$PORT" --no-open > tray_exec.log 2>&1 &
+          TRAY_PID=$!
+
+          READY=0
+          for i in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:$PORT/api/version" >/dev/null 2>&1; then
+              echo "Server with --tray responsive after $i attempt(s)"
+              READY=1
+              break
+            fi
+            sleep 0.5
+          done
+
+          if [ "$READY" -ne 1 ]; then
+            echo "::error::Server with --tray failed to respond on port $PORT within 15s"
+            cat tray_exec.log 2>/dev/null || true
+            kill $TRAY_PID 2>/dev/null || taskkill //F //IM pencarimovie-server.exe 2>/dev/null || true
+            exit 1
+          fi
+
+          case "$RUNNER_OS" in
+            Linux)
+              SCRIPT="$TEST_ROOT/storage/tray/pm-tray.sh"
+              if [ -f "$SCRIPT" ]; then
+                echo "Linux tray script verified: $SCRIPT"
+                test -x "$SCRIPT"
+                echo "Linux tray script is executable (+x)"
+              else
+                echo "::error::Linux embedded tray script was not generated at $SCRIPT"
+                exit 1
+              fi
+              echo "Testing Linux autostart lifecycle..."
+              sh desktop/linux/autostart-on.sh
+              sh desktop/linux/autostart-off.sh
+              ;;
+            Windows)
+              sleep 2
+              LOG="$TEST_ROOT/storage/server.log"
+              if [ -f "$LOG" ]; then
+                echo "Windows server.log created: $LOG"
+                grep -i "tray" "$LOG" || true
+              fi
+              ./pms.cmd --version
+              echo "Testing Windows autostart scripts..."
+              cmd //c "desktop\\windows\\autostart-on.bat"
+              cmd //c "desktop\\windows\\autostart-off.bat"
+              ;;
+            macOS)
+              echo "Testing macOS LaunchAgent autostart scripts..."
+              sh desktop/macos/autostart-on.sh
+              sh desktop/macos/autostart-off.sh
+              rm -rf desktop/macos/storage 2>/dev/null || true
+              echo "macOS --tray and LaunchAgent scripts successfully verified"
+              ;;
+          esac
+
+          kill $TRAY_PID 2>/dev/null || taskkill //F //IM pencarimovie-server.exe 2>/dev/null || true
+          wait $TRAY_PID 2>/dev/null || true
+          rm -rf "$TEST_ROOT" server_test.log tray_exec.log 2>/dev/null || true
+          echo "Tray and launcher test passed for ${{ matrix.artifact }}"
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME="pencarimovie-server-${{ matrix.artifact }}"
+          # bin_dir is per-matrix-entry: a cross-built leg puts its output under
+          # `target/<triple>/release`, not `target/release`.
+          BIN="${{ matrix.bin_dir }}/pencarimovie-server"
+          [ -f "$BIN" ] || BIN="$BIN.exe"
+          echo "binary: $BIN"
+          "$BIN" --version
+
+          mkdir -p "stage/$NAME/storage" dist-rust
+          cp "$BIN" "stage/$NAME/"
+          cp desktop/README.txt "stage/$NAME/"
+          case "$RUNNER_OS" in
+            Windows)
+              cp desktop/windows/* "stage/$NAME/"
+              [ -f tray.ico ] && cp tray.ico "stage/$NAME/pencarimovie.ico" || true
+              ;;
+            Linux)
+              cp desktop/linux/* "stage/$NAME/"
+              [ -f tray.png ] && cp tray.png "stage/$NAME/pencarimovie.png" || true
+              ;;
+            macOS)
+              rm -rf desktop/macos/storage 2>/dev/null || true
+              cp desktop/macos/* "stage/$NAME/"
+              [ -f tray.png ] && cp tray.png "stage/$NAME/pencarimovie.png" || true
+              ;;
+          esac
+          chmod +x "stage/$NAME"/*.sh "stage/$NAME"/*.command 2>/dev/null || true
+          chmod +x "stage/$NAME/pencarimovie-server" 2>/dev/null || true
+
+          tar -czf "dist-rust/$NAME.tar.gz" -C stage "$NAME"
+          if command -v sha256sum >/dev/null 2>&1; then
+            ( cd dist-rust && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256" )
+          else
+            ( cd dist-rust && shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256" )
+          fi
+          ls -lh dist-rust/
+
+      # ── Verify Windows Installer & Updater Lifecycle ─────────────────────────
+      # On Windows, test that the installer script from telegra.my actually works:
+      # 1. Fresh install into a test directory.
+      # 2. Re-run when current skips download ("Already on the latest build").
+      # 3. Update over a RUNNING server kills old process and copies files with
+      #    no "process cannot access the file ... used by another process" error.
+      - name: Test Windows Installer & Updater Lifecycle
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Testing Windows installer lifecycle against dist-rust package..."
+
+          # Extract the PowerShell installer script from the worker and point base/homeDir to local test
+          node -e '
+            const fs = require("fs");
+            const os = require("os");
+            const path = require("path");
+            const src = fs.readFileSync("cloudflare-worker-telegra-my.js", "utf8");
+            const mark = "const PS1_INSTALL = `";
+            const start = src.indexOf(mark);
+            const end = src.indexOf("\n`;", start + mark.length);
+            let script = src.slice(start + mark.length, end + 1);
+
+            script = script.replace(/\$base\s*=\s*'\''[^'\''\r\n]+'\''/, "$base = '\''http://127.0.0.1:18097'\''");
+            script = script.replace(/\$homeDir\s*=\s*[^\r\n]+/, "$homeDir = (Join-Path $env:TEMP '\''pm-ci-home'\'')");
+
+            fs.writeFileSync(path.join(os.tmpdir(), "pm-installer-test.ps1"), script);
+          '
+
+          # Start mock HTTP server on 127.0.0.1:18097 serving dist-rust/
+          node -e '
+            const http = require("http");
+            const fs = require("fs");
+            const path = require("path");
+            http.createServer((req, res) => {
+              const file = path.join("dist-rust", path.basename(req.url));
+              if (fs.existsSync(file)) {
+                res.end(fs.readFileSync(file));
+              } else {
+                res.statusCode = 404; res.end();
+              }
+            }).listen(18097, "127.0.0.1");
+          ' &
+          MOCK_PID=$!
+          sleep 1
+
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -Command '
+            $ErrorActionPreference = "Stop"
+            $testScript = Join-Path $env:TEMP "pm-installer-test.ps1"
+            $testHome = Join-Path $env:TEMP "pm-ci-home"
+            $testInstall = Join-Path $testHome "pencarimovie-server"
+
+            Remove-Item $testHome -Recurse -Force -ErrorAction SilentlyContinue
+
+            Write-Host "1. Testing clean install..."
+            $out1 = powershell.exe -NoProfile -ExecutionPolicy Bypass -File $testScript | Out-String
+            Write-Host $out1
+            if (-not (Test-Path "$testInstall\pencarimovie-server.exe")) {
+              throw "Installer failed: pencarimovie-server.exe not found"
+            }
+            if (-not (Test-Path "$testInstall\.release-sha256")) {
+              throw "Installer failed: .release-sha256 stamp not found"
+            }
+
+            Write-Host "2. Testing re-run when build is already latest (should skip download)..."
+            $out2 = powershell.exe -NoProfile -ExecutionPolicy Bypass -File $testScript | Out-String
+            Write-Host $out2
+            if ($out2 -notmatch "Already on the latest build") {
+              throw "Installer failed to skip download when version matches"
+            }
+
+            Write-Host "3. Testing update over a RUNNING server process..."
+            # Start the installed binary in background
+            $proc = Start-Process "$testInstall\pencarimovie-server.exe" -ArgumentList "--port","18093","--no-open" -PassThru
+            Start-Sleep -Seconds 2
+
+            # Remove stamp to simulate a new release available
+            Remove-Item "$testInstall\.release-sha256" -Force
+
+            # Run installer again while server is running - must cleanly stop it and copy without file-lock error
+            $out3 = powershell.exe -NoProfile -ExecutionPolicy Bypass -File $testScript | Out-String
+            Write-Host $out3
+            if ($out3 -match "used by another process") {
+              throw "Installer crashed with file-lock error during update!"
+            }
+            if ($out3 -notmatch "Stopping the running server") {
+              throw "Installer failed to detect and stop running server"
+            }
+            if (-not (Test-Path "$testInstall\.release-sha256")) {
+              throw "Installer failed to re-create .release-sha256 after update"
+            }
+
+            # Cleanup test root and process
+            if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+            Remove-Item $testHome -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "Windows Installer & Updater Lifecycle verification PASSED."
+          '
+
+          kill $MOCK_PID 2>/dev/null || true
+
+      # `release-` prefix so `publish` can glob exactly the five tarball
+      # artifacts without also pulling the `container-*` ones (whose payload is a
+      # bare `pencarimovie-server` and would collide under merge-multiple).
+      - uses: actions/upload-artifact@v5
+        with:
+          name: release-${{ matrix.artifact }}
+          path: dist-rust/*
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v5
+        if: matrix.musl_target != ''
+        with:
+          name: container-${{ matrix.artifact }}
+          path: dist-container/${{ matrix.container_arch }}/pencarimovie-server
+          if-no-files-found: error
+
+  # ── the deployable container, one arch per native runner ───────────────────
+  # Each leg DOWNLOADS an already-built musl binary and only COPYs it
+  # (Dockerfile.release), so a leg costs seconds instead of the ~45 min
+  # arm64/QEMU build it replaced.
+  # `ubuntu-24.04-arm` is a public runner; if it were ever unavailable the job
+  # fails at SCHEDULING with a message that reads like a YAML error, so check the
+  # runner label first before suspecting this file.
+  docker:
+    # `prepare` is required because the per-arch push below reads
+    # `needs.prepare.outputs.tag`; without it those expressions resolve to empty.
+    needs: [prepare, native-build]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+            artifact: container-linux-x86_64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            artifact: container-linux-aarch64
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.commit_sha || github.sha }}
+
+      - name: Download the prebuilt binary
+        uses: actions/download-artifact@v5
+        with:
+          name: ${{ matrix.artifact }}
+          # Dockerfile.release does `COPY dist-docker/${ARCH}/pencarimovie-server`,
+          # so the artifact must land at exactly that path.
+          path: dist-docker/${{ matrix.arch }}
+
+      - name: Build image (COPY only — no toolchain, no source)
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          PUBLISH: ${{ needs.prepare.outputs.publish }}
+        run: |
+          set -euo pipefail
+          BIN="dist-docker/${{ matrix.arch }}/pencarimovie-server"
+          # Fail with a clear message instead of Docker's opaque
+          # "COPY failed: no source files were specified" when the artifact
+          # download landed somewhere unexpected.
+          if [ ! -f "$BIN" ]; then
+            echo "::error::$BIN is missing — the container artifact was not downloaded"
+            ls -R dist-docker 2>/dev/null || true
+            exit 1
+          fi
+          chmod +x "$BIN"
+          docker build \
+            -f Dockerfile.release \
+            --build-arg ARCH=${{ matrix.arch }} \
+            --platform linux/${{ matrix.arch }} \
+            -t pencarimovie-server:native .
+
+      # Both architectures are verified now; previously only amd64 ever was.
+      - name: Smoke test (version + dashboard + addon manifest)
+        run: |
+          set -euo pipefail
+          docker run -d --name pm -p 18088:8088 pencarimovie-server:native
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18088/api/version >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          echo "--- /api/version"; curl -fsS http://127.0.0.1:18088/api/version; echo
+          echo "--- /"; curl -fsS -o /dev/null -w '%{http_code} %{size_download} bytes\n' http://127.0.0.1:18088/
+          echo "--- /manifest.json"; curl -fsS -o /dev/null -w '%{http_code} %{size_download} bytes\n' http://127.0.0.1:18088/manifest.json
+          echo "--- /eclipse/manifest.json"; curl -fsS -o /dev/null -w '%{http_code} %{size_download} bytes\n' http://127.0.0.1:18088/eclipse/manifest.json || true
+          docker logs pm | tail -n 20
+          docker rm -f pm
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # Push an arch-suffixed tag only. `docker-manifest` assembles these into
+      # the multi-arch `:latest` / `:native` / `:$TAG` tags.
+      # Gate on `publish`, NOT on a non-empty TAG. `prepare` fills `tag` with the
+      # latest git tag even for a Docker-only run (so the summary can suggest the
+      # next version), so `[ -n "$TAG" ]` is ALWAYS true and used to publish
+      # `:v<latest release>` from an untagged build — the exact thing the
+      # `:latest` contract in `docker-manifest` exists to prevent.
+      - name: Push the per-architecture image
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          PUBLISH: ${{ needs.prepare.outputs.publish }}
+        run: |
+          set -euo pipefail
+          docker tag pencarimovie-server:native "$IMAGE:native-${{ matrix.arch }}"
+          docker push "$IMAGE:native-${{ matrix.arch }}"
+          if [ "$PUBLISH" = "true" ] && [ -n "${TAG:-}" ]; then
+            docker tag pencarimovie-server:native "$IMAGE:${TAG}-${{ matrix.arch }}"
+            docker push "$IMAGE:${TAG}-${{ matrix.arch }}"
+          fi
+
+  # ── assemble the multi-arch manifest list from the two native images ───────
+  # No QEMU: `imagetools create` only rewrites the manifest, it never executes
+  # any layer. `:native` MUST be published — render.yaml pins
+  # `ghcr.io/aiskendi/pencarimovie-server:native` as `runtime: image`, and it
+  # simply becomes a manifest list instead of a single amd64 image.
+  docker-manifest:
+    needs: [prepare, docker]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Create and push the multi-arch manifest
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          PUBLISH: ${{ needs.prepare.outputs.publish }}
+        run: |
+          set -euo pipefail
+          # `:preview` (not `:latest`) is what the UNTAGGED / Docker-only run
+          # refreshes. Reason, and it cost a real round-trip: telegra.my's
+          # /docker installer pulls `:latest`, and a workflow_dispatch with an
+          # empty tag used to REPOINT `:latest` at a build with no release tag
+          # behind it. Every Docker user then silently received an untagged
+          # binary while the dashboard still showed the release version - which
+          # reads exactly like "docker did not rebuild". So:
+          #   :latest  -> only ever a TAGGED release
+          #   :native  -> mirrored continuously (render.yaml / heroku.yml pin it)
+          #   :preview -> untagged builds, never handed to end users
+          # Gate on `publish`, NOT on a non-empty TAG — see the note on the
+          # per-architecture push above. An untagged run arrives here with
+          # TAG=v<latest release> filled by `prepare`, which silently repointed
+          # `:latest` at a build with no release behind it (observed: a
+          # Docker-only dispatch moved `:latest` and `:v2.9.2`).
+          # `sha-<short>` is IMMUTABLE and published by every run, tagged or not.
+          # It is what `deploy-heroku.yml` pins to: that workflow used to promote
+          # `:native`, a moving tag nothing rebuilds on push (this workflow is
+          # workflow_dispatch-only), so Heroku silently received whatever image
+          # happened to be there — the deploy was green and the app was stale.
+          SHA_TAG="sha-$(printf '%s' "${{ needs.prepare.outputs.commit_sha || github.sha }}" | cut -c1-7)"
+          TAGS=(-t "$IMAGE:native" -t "$IMAGE:$SHA_TAG")
+          if [ "$PUBLISH" = "true" ] && [ -n "${TAG:-}" ]; then
+            TAGS+=(-t "$IMAGE:latest" -t "$IMAGE:$TAG" -t "$IMAGE:native-$TAG")
+          else
+            TAGS+=(-t "$IMAGE:preview")
+          fi
+          docker buildx imagetools create "${TAGS[@]}" \
+            "$IMAGE:native-amd64" "$IMAGE:native-arm64"
+          echo "=== published manifests ==="
+          for t in "${TAGS[@]}"; do
+            [ "$t" = "-t" ] && continue
+            echo "--- $t"
+            docker buildx imagetools inspect "$t" 2>/dev/null | head -n 20 || true
+          done
+
+      # Fail the release if the arm64 half is missing: that is the exact failure
+      # mode this whole restructure exists to remove.
+      - name: Verify both architectures are present
+        run: |
+          set -euo pipefail
+          OUT="$(docker buildx imagetools inspect "$IMAGE:native")"
+          echo "$OUT"
+          for want in linux/amd64 linux/arm64; do
+            if ! printf '%s' "$OUT" | grep -q "$want"; then
+              echo "::error::$IMAGE:native is missing $want"
+              exit 1
+            fi
+          done
+          echo "Verified: $IMAGE:native carries linux/amd64 AND linux/arm64"
+
+  # ── publish EVERY target to the release in one place ───────────────────────
+  # Previously each matrix leg ran its own `gh release create` retry loop and
+  # uploaded only its own tarball, so a leg that finished early could race the
+  # others. Now both producers are done, everything is downloaded, and the
+  # release gets all five tarballs + their .sha256 sidecars in one upload.
+  publish:
+    needs: [prepare, native-build, docker-manifest]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.commit_sha || github.sha }}
+
+      - name: Download every release artifact
+        uses: actions/download-artifact@v5
+        with:
+          # Only the tarball artifacts. `container-*` artifacts hold a bare
+          # `pencarimovie-server` and would collide under merge-multiple.
+          pattern: release-*
+          path: dist-all
+          merge-multiple: true
+
+      # NOTE: no `.sh` installers and no logo.png are uploaded any more.
+      # `telegra.my` serves its OWN inline installers (SH_INSTALL / PS1_INSTALL /
+      # SH_TERMUX / SH_DOCKER in cloudflare-worker-telegra-my.js) which resolve
+      # `releases/latest/download/pencarimovie-server-<os>-<arch>.tar.gz` at run
+      # time, so they need no copy in the release. Nothing else downloads the
+      # repo's `pencarimovie-*.sh` from a release URL either. Uploading them was
+      # noise that also implied a coupling that does not exist.
+      #
+      # IMPORTANT: `telegra.my` resolves `releases/latest`, and GitHub decides
+      # that by semver AND creation time, not by "most recently published". A
+      # release with an OLDER tag created later can therefore still lose to a
+      # newer-tagged one, so always release incrementally - otherwise an
+      # installer keeps fetching the previous build and it looks like the image
+      # "did not rebuild".
+      - name: List what will be published
+        run: |
+          set -euo pipefail
+          ls -lh dist-all/
+
+      - name: Assert all five architectures are present
+        run: |
+          set -euo pipefail
+          missing=0
+          for target in linux-x86_64 linux-aarch64 windows-x86_64 macos-aarch64 macos-x86_64; do
+            f="dist-all/pencarimovie-server-$target.tar.gz"
+            if [ ! -f "$f" ]; then
+              echo "::error::missing $f"
+              missing=1
+              continue
+            fi
+            # Every tarball must carry its own .sha256: the POSIX installers
+            # verify it before `tar -xzf` and otherwise can only warn.
+            if [ ! -f "$f.sha256" ]; then
+              echo "::error::missing $f.sha256"
+              missing=1
+            fi
+            echo "OK  $target"
+          done
+          ls -R dist-all | head -n 40
+          exit "$missing"
+
+      - name: Upload every asset to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" dist-all/* --clobber
+          echo "=== release assets ==="
+          gh release view "$TAG" --json assets \
+            --jq '.assets[] | "\(.name)  \(.size)"'
+
+  # ── summary ────────────────────────────────────────────────────────────────
+  summary:
+    needs: [prepare, docker-manifest, publish]
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.commit_sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Write the run summary
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          PUBLISHED: ${{ needs.prepare.outputs.publish }}
+        run: |
+          set -euo pipefail
+          NEXT="v1.0.0"
+          if [[ "${TAG:-}" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+            NEXT="v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3] + 1))"
+          else
+            LATEST="$(git tag -l 'v*' --sort=-v:refname | head -n 1)"
+            if [[ "$LATEST" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+              NEXT="v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3] + 1))"
+            fi
+          fi
+
+          {
+            echo "# 🚀 Release Build & Docker Publish Summary"
+            echo
+            if [ "$PUBLISHED" = "true" ]; then
+              echo "- **Published release tag**: \`$TAG\`"
+              echo "- **Next version to use**: \`$NEXT\` 🎉"
+            else
+              echo "- **Release**: none (no tag supplied — Docker image only)"
+              echo "- **Next version to use**: \`$NEXT\`"
+            fi
+            echo "- **Docker image (multi-arch)**: \`$IMAGE:latest\` / \`:native\`"
+            echo
+            echo "## Artifacts (all built natively — no QEMU)"
+            echo
+            echo "| target | runner |"
+            echo "| --- | --- |"
+            echo "| \`linux-x86_64\` | ubuntu-latest |"
+            echo "| \`linux-aarch64\` | ubuntu-24.04-arm |"
+            echo "| \`windows-x86_64\` | windows-latest |"
+            echo "| \`macos-aarch64\` | macos-14 |"
+            echo "| \`macos-x86_64\` | macos-14 (native cross-link) |"
+            echo "| container \`linux/amd64\` | ubuntu-latest (glibc) |"
+            echo "| container \`linux/arm64\` | ubuntu-24.04-arm (glibc) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notice the next version
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ "${TAG:-}" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+            echo "::notice title=Next Recommended Release Tag::Next release version to use: v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3] + 1))"
+          fi

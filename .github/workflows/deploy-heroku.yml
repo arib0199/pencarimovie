@@ -1,0 +1,261 @@
+name: Deploy to Heroku
+
+# MANUAL ONLY: Actions -> "Deploy to Heroku" -> Run workflow.
+#
+# Why this workflow instead of Heroku's own GitHub integration: this app is on
+# the **container** stack (`heroku.yml` -> `Dockerfile`), and the dashboard
+# "Automatic deploys" toggle is only offered for buildpack apps. Pushing an
+# image to `registry.heroku.com/<app>/web` is the supported path for container
+# stacks.
+#
+# ── WHAT THIS JOB DOES, AND WHAT IT REFUSES TO DO ───────────────────────────
+# It moves ONE image that already exists in GHCR into Heroku's registry:
+#
+#   - the `image` input when given (any published tag: `sha-8ad2f40`, `v1.1.0`),
+#   - otherwise `:sha-<7>` for the commit the run was started on, which is what
+#     every `release.yml` run publishes.
+#
+# It does NOT build, it does NOT dispatch `release.yml`, and it does NOT fall
+# back to `:native` or "whatever is newest". That last one is the bug this file
+# was written around: `:native` is a MOVING tag that nothing rebuilt on a push,
+# so the job went green while Heroku kept serving an older binary (the live app
+# answered `build: "0.1.0"`, i.e. built without `.git`, and every client showed
+# "Update available"). When the tag is missing the job FAILS and prints the tag
+# it looked for — publish with "Release Builder & Docker Publish" first, then
+# run this workflow again.
+#
+# There is also no `git push heroku` fallback: Heroku's classic Docker builder
+# cannot build this repo's `Dockerfile` at all (`RUN --mount=type=cache` →
+# "the --mount option requires BuildKit"), so that path only ever produced a
+# second, slower failure after the real one. A failed promotion is now exactly
+# one red step with the registry error in it.
+#
+# Required repository secret: HEROKU_API_KEY
+#   Get it with `heroku authorizations:create -d "github-actions pm-server"`
+#   or from https://dashboard.heroku.com/account/applications
+#   Add it with `gh secret set HEROKU_API_KEY` (or Settings -> Secrets -> Actions).
+
+on:
+  # Manual only, on purpose: a deploy is a decision, not a side effect of a
+  # push. Nothing here rebuilds anything, so there is no per-commit run worth
+  # automating — `release.yml` publishes the image, this workflow ships it.
+  workflow_dispatch:
+    inputs:
+      image:
+        # Promote a specific build instead of this commit's. Needed when the
+        # commit is CI/docs-only (no image of its own) or when re-shipping the
+        # same binary after a failed promotion.
+        description: "Tag to promote (e.g. sha-8ad2f40 or v1.1.0). Empty = :sha-<7> of this commit."
+        required: false
+        default: ""
+
+# One deploy at a time. A second manual run WAITS for the first instead of
+# killing it half-way through a registry push.
+concurrency:
+  group: heroku-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # Pull this repository's own published image.
+  packages: read
+
+env:
+  HEROKU_APP: pm-server
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  deploy:
+    name: Promote a published image to Heroku
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      # No checkout: this job only talks to two registries and the Heroku API.
+      # Fail fast with a clear message instead of a confusing auth error.
+      - name: Check for HEROKU_API_KEY
+        run: |
+          if [ -z "${{ secrets.HEROKU_API_KEY }}" ]; then
+            echo "::error::Repository secret HEROKU_API_KEY is not set."
+            echo "Create one with: heroku authorizations:create -d \"github-actions\""
+            echo "Then add it:      gh secret set HEROKU_API_KEY"
+            exit 1
+          fi
+
+      - name: Log in to GHCR
+        run: |
+          set -euo pipefail
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # Heroku CLI, not a raw registry login: `container:release` is the
+      # supported release path and it also does the registry login. The previous
+      # `PATCH /formation` returned HTTP 200 yet the dyno kept running the old
+      # image (`build: 0.1.0`) — green deploy, stale app, twice.
+      - name: Install the Heroku CLI
+        run: |
+          set -euo pipefail
+          curl -fsSL https://cli-assets.heroku.com/install.sh | sh
+          heroku --version
+
+      - name: Log in to the Heroku registry
+        env:
+          HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
+        run: |
+          set -euo pipefail
+          echo "$HEROKU_API_KEY" | docker login --username=_ --password-stdin registry.heroku.com
+          heroku container:login 2>&1 | tail -n 2 || true
+
+      # ── resolve the image to promote ────────────────────────────────────────
+      # Registry lookup only. Nothing is built, nothing is dispatched and
+      # nothing is waited for.
+      - name: Resolve the image to promote
+        id: img
+        run: |
+          set -euo pipefail
+
+          WANT="$(printf '%s' "${{ github.event.inputs.image }}" | tr -d '[:space:]')"
+          if [ -z "$WANT" ]; then
+            # Every `release.yml` run publishes this tag for the commit it built.
+            WANT="sha-$(printf '%s' "$GITHUB_SHA" | cut -c1-7)"
+          fi
+          # Accept a bare tag (`sha-8ad2f40`) or a full ref pasted from a
+          # `docker pull` line (`ghcr.io/<repo>:sha-8ad2f40`).
+          WANT="${WANT#ghcr.io/}"
+          WANT="${WANT#"${GITHUB_REPOSITORY}:"}"
+          WANT="${WANT#${IMAGE}:}"
+          WANT="${WANT#:}"
+
+          if docker manifest inspect "${IMAGE}:${WANT}" >/dev/null 2>&1; then
+            echo "ref=${IMAGE}:${WANT}" >> "$GITHUB_OUTPUT"
+            echo "::notice::Promoting the published image ${IMAGE}:${WANT}"
+            exit 0
+          fi
+
+          # Fail loudly and say exactly what is missing. Deploying something
+          # else "so the deploy is not red" is what produced a live app
+          # reporting build 0.1.0 for several releases.
+          echo "::error::${IMAGE}:${WANT} is not published in GHCR."
+          echo "Publish it first: Actions -> 'Release Builder & Docker Publish' -> Run workflow"
+          echo "  (each run publishes :sha-<7> for the commit it builds, plus :native and, when tagged, :latest)"
+          echo "Then run this workflow again, or pass an existing tag as the 'image' input."
+          exit 1
+
+      # ── promote it (no rebuild, no source in the image) ─────────────────────
+      #
+      # ── WHY THIS IS NOT `docker pull` + `docker push` ───────────────────────
+      # `:sha-<short>` is a MULTI-ARCH MANIFEST LIST: `release.yml` assembles
+      # `native-amd64` + `native-arm64` with `imagetools create`. Two things
+      # break the obvious promotion:
+      #
+      #   1. A tag that resolves to an index is ALSO STORED AS AN INDEX, so
+      #      `docker push` re-uploads the whole list — including the arm64
+      #      manifest whose layers were never downloaded here.
+      #   2. Heroku's registry stores exactly one kind of artifact: a
+      #      SINGLE-platform linux/amd64 image in Docker v2 schema 2 media
+      #      types. An OCI index is rejected outright.
+      #
+      # Observed, and why this comment exists:
+      #
+      #   4f4fb700ef54: Unavailable          <- arm64 blobs, never pulled
+      #   error from registry: unsupported   <- the index itself
+      #
+      # Both architectures still stay published on GHCR (render.yaml pulls
+      # `:native`, which must remain a list). Only the PROMOTION is narrowed to
+      # the architecture a dyno actually runs.
+      - name: Deploy the pinned image
+        id: image
+        continue-on-error: true
+        env:
+          HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
+          REF: ${{ steps.img.outputs.ref }}
+        run: |
+          set -euo pipefail
+          DST="registry.heroku.com/${HEROKU_APP}/web"
+
+          # Resolve the linux/amd64 sub-manifest digest. Registry-side only, no
+          # image is pulled. A tag that is already a plain manifest (no
+          # `.Manifest.Manifests`) prints nothing here and is used as-is.
+          AMD64="$(
+            docker buildx imagetools inspect --format \
+              '{{range .Manifest.Manifests}}{{.Platform.OS}}/{{.Platform.Architecture}} {{.Digest}}{{"\n"}}{{end}}' \
+              "$REF" 2>/dev/null |
+              awk '$1 == "linux/amd64" { print $2; exit }' || true
+          )"
+          # `repo@digest`, never `repo:tag@digest`: skopeo rejects a reference
+          # that carries both ("Docker references with both a tag and digest are
+          # currently not supported"). `${REF%:*}` drops the tag, and the repo
+          # itself carries no colon (ghcr.io/<owner>/<repo>).
+          if [ -n "$AMD64" ]; then SRC="${REF%:*}@${AMD64}"; else SRC="$REF"; fi
+          echo "Promoting ${SRC}"
+          echo "       -> ${DST}"
+
+          # skopeo copies ONE platform and rewrites the manifest to Docker v2
+          # schema 2 (`--format v2s2`), which is what Heroku accepts. `--all=false`
+          # is explicit so a future default cannot silently turn this back into
+          # the index push that failed with "unsupported".
+          if ! command -v skopeo >/dev/null 2>&1; then
+            sudo apt-get update -qq >/dev/null 2>&1 || true
+            sudo apt-get install -y -qq skopeo >/dev/null 2>&1 || true
+          fi
+          if command -v skopeo >/dev/null 2>&1; then
+            AUTH=()
+            if [ -f "$HOME/.docker/config.json" ]; then
+              AUTH=(--authfile "$HOME/.docker/config.json")
+            fi
+            skopeo copy --all=false --override-os linux --override-arch amd64 \
+              --format v2s2 "${AUTH[@]}" "docker://${SRC}" "docker://${DST}"
+          else
+            echo "::warning::skopeo unavailable - falling back to a single-manifest docker pull/push"
+            docker pull "$SRC"
+            docker tag "$SRC" "$DST"
+            docker push "$DST"
+          fi
+
+          # A stored index would deploy green and then crash the dyno at exec,
+          # so refuse to release one.
+          if docker buildx imagetools inspect --raw "$DST" 2>/dev/null |
+               grep -qE 'image\.index|manifest\.list'; then
+            echo "::error::${DST} holds a manifest index/OCI index - Heroku dynos cannot run it."
+            exit 1
+          fi
+
+          # The real release. A bare `PATCH /formation` answered 200 without
+          # rolling the dyno (the app kept serving the old build), so this uses
+          # the CLI, which fails loudly when it cannot release.
+          heroku container:release web -a "$HEROKU_APP"
+          echo "--- recent releases"
+          heroku releases -a "$HEROKU_APP" --num 3 || true
+
+      # ── prove what is actually running ─────────────────────────────────────
+      # The whole point of this workflow is "the commit reached production", so
+      # read it back from the app instead of trusting the push. A `build` of
+      # "0.1.0" means the binary was compiled without `.git` (no `git describe`),
+      # i.e. the stale/Heroku-built image is live again.
+      - name: Verify the deployed build
+        if: always() && steps.image.outcome == 'success'
+        env:
+          HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
+        run: |
+          set -uo pipefail
+          URL="$(curl -sS -H 'Accept: application/vnd.heroku+json; version=3' \
+            -H "Authorization: Bearer ${HEROKU_API_KEY}" \
+            "https://api.heroku.com/apps/${HEROKU_APP}" \
+            | python3 -c 'import json,sys;print(json.load(sys.stdin).get("web_url",""))')"
+          [ -n "$URL" ] || URL="https://stream.pencarimovie.com"
+          # Heroku's `web_url` ends with a SLASH (`https://<app>.herokuapp.com/`),
+          # so `${URL}/api/version` produced `…herokuapp.com//api/version`. Some
+          # proxies and the dashboard's URL checks treat that as a different path.
+          while [ "${URL%/}" != "$URL" ]; do URL="${URL%/}"; done
+          echo "Probing ${URL}/api/version"
+
+          for i in $(seq 1 30); do
+            BODY="$(curl -sS -m 20 "${URL}/api/version" || true)"
+            if printf '%s' "$BODY" | grep -q '"build"'; then break; fi
+            sleep 4
+          done
+          echo "$BODY"
+          BUILD="$(printf '%s' "$BODY" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("build",""))' 2>/dev/null || true)"
+          echo "build=${BUILD}"
+          if [ "$BUILD" = "0.1.0" ]; then
+            echo "::warning::The live binary reports build 0.1.0 - it was compiled without .git/tags, so it is NOT this commit's image."
+          fi
